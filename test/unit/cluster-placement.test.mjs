@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
@@ -20,18 +21,22 @@ import {
 import {
   inspectClusterPayloadChanges,
   refreshNodeSlotPayload,
+  reloadRemoteSlot,
   remoteIptablesScript,
   slotContainerBody,
   slotEgressNames,
+  startRemoteSlot,
 } from '../../src/lib/cluster/remote-slot.mjs'
 import {
   ensureRemoteOfficialCredentialLink,
   pullSlotCredentials,
+  pushCragSlot,
+  pushSlotBinaries,
   pushSlotCredentials,
   reconcileSlotCredentials,
   remoteSlotPath,
 } from '../../src/lib/cluster/remote-slot-files.mjs'
-import { slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
+import { cragSlotPayload, slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
 import { tarStream } from '../../src/lib/cluster/tar.mjs'
 import { SocketRelay } from '../../src/lib/cluster/socket-relay.mjs'
 import { connectSsh } from '../../src/lib/cluster/ssh-link.mjs'
@@ -107,6 +112,7 @@ function fakeNode(files = new Map()) {
       // readRemoteFileNoFollow: dd … | base64. Missing → exit 3; symlink → refused.
       // The path sits inside `bash -c '…'`, so its own quotes arrive as '\''…'\''.
       const m = /f='\\''(.+?)'\\''.*iflag=nofollow/.exec(cmd)
+      const hashed = /f='\\''(.+?)'\\''.*sha256sum/.exec(cmd)
       let code = 0
       let out = ''
       if (m) {
@@ -114,6 +120,10 @@ function fakeNode(files = new Map()) {
         if (links.has(p)) code = 1
         else if (!files.has(p)) code = 3
         else out = files.get(p).toString('base64')
+      } else if (hashed) {
+        const p = hashed[1]
+        if (links.has(p) || !files.has(p)) code = 3
+        else out = crypto.createHash('sha256').update(files.get(p)).digest('hex')
       }
       setImmediate(() => {
         if (out) stream.emit('data', Buffer.from(out))
@@ -400,6 +410,129 @@ function fakeElf(file, fill) {
   fs.writeFileSync(file, buf, { mode: 0o755 })
 }
 
+function slotPayloadFixture(t) {
+  const root = tmpDir('kin-optional-crag-')
+  const keys = [
+    'KIN_KERNEL_BIN',
+    'KIN_WORKER_BIN',
+    'KIN_EGRESS_BIN',
+    'KIN_CODEX_KERNEL_BIN',
+    'KIN_OAUTH_AUTH_BIN',
+    'KIN_WRAP_CLI_ROOT',
+    'KIN_CLUSTER_WORKER_BIN',
+    'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
+  ]
+  const saved = keys.map((key) => [key, process.env[key]])
+  for (const key of keys) delete process.env[key]
+  for (const file of [
+    'share/wrap-cli/cli-node',
+    'share/wrap-cli/cc-node',
+    'bin/kin-kernel',
+    'bin/kin-worker',
+    'bin/kin-egress',
+    'bin/kin-oauth-auth',
+    'bin/kin-codex-kernel',
+  ])
+    fakeElf(path.join(root, file), 1)
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  t.after(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  return root
+}
+
+test('a base slot image needs no CRAG installation but retains Codex and egress payloads', (t) => {
+  const root = slotPayloadFixture(t)
+  const spec = slotImageSpec(root, 'ubuntu-24.04')
+  for (const name of ['kin-codex-kernel', 'kin-egress', 'kin-worker', 'kin-oauth-auth']) {
+    assert.ok(spec.files.some((file) => file.name === `usr/local/bin/${name}`))
+  }
+  assert.ok(spec.files.some((file) => file.name === 'opt/kin/kin-kernel'))
+  assert.equal(
+    spec.files.some((file) => file.name.includes('/crag')),
+    false,
+  )
+  assert.throws(() => cragSlotPayload(root), { code: 'slot_payload_missing' })
+  seedEncryptedPackage(root)
+  const installed = slotImageSpec(root, 'ubuntu-24.04')
+  assert.notEqual(installed.ref, spec.ref)
+  assert.ok(installed.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2.payload.enc'))
+})
+
+test('optional CRAG payload rejects incomplete, corrupt, and explicitly misconfigured installations', (t) => {
+  const root = slotPayloadFixture(t)
+  const dir = path.join(root, 'share/crag/kernels/v2/amd64')
+  fs.mkdirSync(dir, { recursive: true })
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+  const installed = seedEncryptedPackage(root)
+  process.env.KIN_CRAG_V2_ROOT = path.join(root, 'missing-override')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  delete process.env.KIN_CRAG_V2_ROOT
+  const pointer = path.join(root, 'share/crag/kernels/v2/current-amd64.json')
+  fs.writeFileSync(pointer, '{')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'kernel_cache_invalid' })
+  fs.unlinkSync(pointer)
+  fs.appendFileSync(path.join(installed, 'crag-v2.payload.enc'), 'damaged')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+})
+
+test('common remote service push works for Codex and wrap without a CRAG package', async (t) => {
+  const root = slotPayloadFixture(t)
+  for (const platform of ['openai', 'anthropic']) {
+    const node = fakeNode()
+    const slot = { ...vm, platform }
+    const result = await pushSlotBinaries(slot, root, node.session)
+    assert.equal(result.crag.skipped, 'missing')
+    const remote = `${node.session.host.root}/vms/${slot.id}/slot-bin`
+    for (const name of ['kin-worker', 'kin-egress']) {
+      assert.deepEqual(node.files.get(`${remote}/${name}`), fs.readFileSync(path.join(root, 'bin', name)))
+    }
+    assert.ok(node.files.has(`${remote}/kin-kernel.bin`))
+    assert.equal(node.files.has(`${remote}/crag.digest`), false)
+    await assert.rejects(pushCragSlot(slot, root, node.session), { code: 'slot_payload_missing' })
+  }
+})
+
+test('remote wrap refresh needs no CRAG package while selected CRAG still rejects it', async (t) => {
+  const root = slotPayloadFixture(t)
+  const node = fakeNode()
+  const slot = { ...vm, kernel: 'ubuntu-24.04', status: 'running', dataplane: 'wrap' }
+  const image = slotImageSpec(root, slot.kernel).ref
+  const options = {
+    sessionFor: async () => node.session,
+    inspect: async () => ({
+      State: { Running: true },
+      Config: {
+        Image: image,
+        Cmd: ['/opt/kin-live/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      },
+    }),
+  }
+  const result = await refreshNodeSlotPayload(slot, root, options)
+  assert.equal(result.ok, true)
+  assert.equal(result.restarted, false)
+  const denied = await refreshNodeSlotPayload({ ...slot, dataplane: 'crag', crag_kernel_version: 'v2' }, root, options)
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, 'slot_payload_missing')
+})
+
+test('remote CRAG start and reload require the package before contacting a node', async (t) => {
+  const root = slotPayloadFixture(t)
+  const slot = { ...vm, kernel: 'ubuntu-24.04' }
+  for (const operation of [startRemoteSlot, reloadRemoteSlot]) {
+    const result = await operation(slot, root, { routing: { inference: { dataplane: 'crag' } } })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'slot_payload_missing')
+  }
+})
+
 test('slot image tag follows payload bytes only; a VERSION bump keeps the image', (t) => {
   const root = tmpDir('kin-slot-image-')
   fs.writeFileSync(path.join(root, 'VERSION'), '9.9.9\n')
@@ -471,7 +604,12 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   assert.notEqual(slotImageSpec(root, 'ubuntu-24.04').ref, a.ref, 'rebuilt cli-node = new image')
   const cragDir = path.join(root, 'share/crag')
   fs.renameSync(cragDir, path.join(root, 'crag-hidden'))
-  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  const withoutCrag = slotImageSpec(root, 'ubuntu-24.04')
+  assert.notEqual(withoutCrag.ref, a.ref)
+  assert.equal(
+    withoutCrag.files.some((file) => file.name.startsWith('opt/kin/crag')),
+    false,
+  )
   fs.renameSync(path.join(root, 'crag-hidden'), cragDir)
   fs.writeFileSync(path.join(root, 'bin/kin-worker'), '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })

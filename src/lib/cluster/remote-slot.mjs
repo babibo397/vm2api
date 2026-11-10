@@ -89,7 +89,7 @@ import {
   remoteSlotPath,
   removeRemoteSlotDir,
 } from './remote-slot-files.mjs'
-import { slotImageSpec } from './slot-image.mjs'
+import { cragSlotPayload, slotImageSpec } from './slot-image.mjs'
 
 const CRAG_V2_SECCOMP = JSON.stringify(
   JSON.parse(fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url), 'utf8')),
@@ -867,7 +867,9 @@ export async function refreshNodeSlotPayload(
     const session = await sessionFor(nodeId)
     // Older images have no CRAG layer. The slot-bin mount is already there, so publish
     // the tree without recreating a container whose image is otherwise current.
-    if (session?.client) await pushCragSlot(vm, projectRoot, session)
+    if (session?.client) {
+      await pushCragSlot(vm, projectRoot, session, { required: resolveKernelDataplane(vm, routing) === 'crag' })
+    }
     const running = recreate !== false && vm.status === 'running'
     // A current image stays up only when its command matches this slot's kernel.
     if (running) {
@@ -1057,6 +1059,7 @@ async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) 
   if (isKvmRuntime(vm) && resolveKernelDataplane(vm, routing || {}) === 'crag') {
     return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' } }
   }
+  if (resolveKernelDataplane(vm, routing) === 'crag') cragSlotPayload(projectRoot)
   vm.kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.timezone = normalizeTimezone(vm.timezone)
   vm.locale = vm.locale || STANDARD_LOCALE

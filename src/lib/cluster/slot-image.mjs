@@ -1,6 +1,6 @@
 /**
  * Self-contained slot image for cluster nodes: the kin-os guest image plus every
- * slot service baked in (kin-kernel and crag-v2, glibc shim, cli-node, cc-node,
+ * installed slot service (kin-kernel and optional crag-v2, glibc shim, cli-node, cc-node,
  * kin-worker for oauth/telemetry, kin-egress, kin-codex-kernel). A remote node
  * never bind-mounts these image binaries from the control plane.
  *
@@ -54,9 +54,23 @@ function requireElf(file, label) {
   }
 }
 /** Cluster slot images are linux amd64 even when the control plane is not. */
-export function cragSlotPayload(projectRoot) {
-  const root = cragV2PackageRoot(projectRoot, 'amd64')
-  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+export function cragSlotPayload(projectRoot, { required = true } = {}) {
+  // Only an absent installation is optional. An explicit override or an existing
+  // factory directory must still be verified, including a missing manifest.
+  let root = String(process.env.KIN_CRAG_V2_ROOT || '').trim() || cragV2PackageRoot(projectRoot, 'amd64')
+  if (!root && projectRoot) {
+    const staged = path.join(projectRoot, 'share/crag/kernels/v2/amd64')
+    try {
+      fs.lstatSync(staged)
+      root = staged
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+  if (!root) {
+    if (required) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+    return { files: [], digest: '' }
+  }
   const verified = verifyCragV2Tree(root, { arch: 'amd64' })
   if (!verified.ok) {
     const missing = verified.code === 'crag_v2_package_missing'
@@ -123,7 +137,7 @@ export function slotPayload(projectRoot) {
   )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
-  files.push(...cragSlotPayload(projectRoot).files)
+  files.push(...cragSlotPayload(projectRoot, { required: false }).files)
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
   requireElf(codex, 'kin-codex-kernel')
   files.push({ name: 'usr/local/bin/kin-codex-kernel', src: codex, mode: 0o755 })

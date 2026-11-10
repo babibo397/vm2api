@@ -16,7 +16,7 @@ and diagnosis remain owned by the existing remote slot lifecycle.
 ## Image
 
 `Dockerfile.proxy-health` uses the official Linux amd64 release by digest and
-replaces only the changed JavaScript module. The upstream UI, binaries and
+replaces only the changed JavaScript modules. The upstream UI, binaries and
 entrypoint remain from that same release; no runtime ConfigMap source overlay
 is needed. Use a dedicated tag when sharing a repository with other services.
 
@@ -44,3 +44,16 @@ v1.4.054. Record the previous Deployment revision for `kubectl rollout undo`.
 After rollout, verify the image digest, source hash, node SSH connections and
 proxy probe result. A healthy unused proxy does not establish that a remote
 slot can reach a model provider; verify that separately with the first slot.
+
+## Remote slot creation without CRAG v2
+
+The official v1.4.061 payload contains the legacy CRAG ELF, but not a complete
+licensed CRAG v2 package. Remote image preparation and generic live-file
+publication previously required that optional package even for Codex slots,
+which do not use CRAG. The remote-slot fix permits the package to be absent
+for those generic operations. Installed packages still undergo validation,
+and explicit CRAG operations retain their package and license requirements.
+
+Verify a remote Ubuntu Docker image can be prepared and an empty Codex slot
+can start without a local Docker socket. Remove the temporary validation slot
+afterward; real account/provider validation still requires imported credentials.
