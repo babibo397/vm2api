@@ -1,0 +1,9 @@
+# Official v1.4.061 Linux amd64 release, with the reviewed control-plane fix.
+# Keep the base pinned so the image is reproducible and rollback is unambiguous.
+FROM ghcr.io/dofastted/vm2api:v1.4.061@sha256:a6be74b4a4ce970bb30f96a07853bf61d8f1c02e5c165b16e5f80bec1bd0a55d
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/babibo397/vm2api" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.version="1.4.061-proxy-health"
+COPY src/lib/vm/proxy-pool.mjs /opt/vm2api/src/lib/vm/proxy-pool.mjs
+RUN node --check /opt/vm2api/src/lib/vm/proxy-pool.mjs

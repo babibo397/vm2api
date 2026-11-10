@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { ProxyPool, MAX_VMS_PER_PROXY, clampBindLimit } from '../../src/lib/vm/proxy-pool.mjs'
+import { applyHold, applyClearHold, HOLD_PROXY } from '../../src/lib/pool/schedule-state.mjs'
 
 function tmpDir(prefix = 'kin-px-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -185,6 +186,7 @@ test('probeOne marks egress_down after SOCKS greeting if helper is dead', async 
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    pool.bind(pool.state.proxies[0].id, 'vm-local')
     const result = await pool.probeOne(pool.state.proxies[0])
     assert.equal(result.ok, false)
     assert.equal(result.error, 'not_running')
@@ -207,6 +209,7 @@ test('probeOne repairs egress then passes', async () => {
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    pool.bind(pool.state.proxies[0].id, 'vm-local')
     const result = await pool.probeOne(pool.state.proxies[0])
     assert.equal(result.ok, true)
     assert.equal(healthy, true)
@@ -230,6 +233,7 @@ test('startScheduler immediately repairs enabled egress', async () => {
   })
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    pool.bind(pool.state.proxies[0].id, 'vm-local')
     pool.startScheduler()
     const deadline = Date.now() + 1000
     while (!healthy && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
@@ -251,6 +255,7 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
     const id = pool.snapshot().proxies[0].id
+    pool.bind(id, 'vm-local')
     await pool.probeById(id)
     await pool.probeById(id)
     const p = pool.snapshot().proxies[0]
@@ -261,6 +266,201 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
     pool.stopScheduler()
     socks.server.close()
   }
+})
+
+async function placedProxy(t, records = [], opts = {}) {
+  const socks = await listenSocks()
+  const dir = tmpDir()
+  const vms = new Map(records.map((vm) => [vm.id, vm]))
+  const pool = new ProxyPool({
+    dataDir: dir,
+    vmNodeOf: (id) => (vms.has(id) ? vms.get(id).node_id || null : undefined),
+    egressCheck: () => ({ ok: false, reason: 'not_running' }),
+    onDisableVm: (id, reason, proxyId) => {
+      if (vms.has(id)) applyHold(vms.get(id), HOLD_PROXY, { tag: proxyId, message: reason })
+    },
+    onEnableVm: (id, _reason, proxyId) => {
+      if (vms.has(id)) applyClearHold(vms.get(id), HOLD_PROXY, { tag: proxyId })
+    },
+    ...opts,
+  })
+  pool.stopScheduler()
+  pool.importLines(`${socks.host}:${socks.port}`)
+  const proxy = pool.state.proxies[0]
+  for (const vm of records) assert.equal(pool.bind(proxy.id, vm.id).ok, true)
+  t.after(() => {
+    pool.stopScheduler()
+    socks.server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  return { pool, proxy, vms }
+}
+
+test('an unused SOCKS proxy clears stale egress errors without starting a local helper', async (t) => {
+  let repairs = 0
+  const { pool, proxy } = await placedProxy(t, [], { repairEgress: () => repairs++ })
+  proxy.last_error = 'egress_down:not_running'
+  const result = await pool.probeById(proxy.id)
+  assert.equal(result.probe.ok, true)
+  assert.equal(result.proxy.last_error, null)
+  assert.equal(repairs, 0)
+})
+
+test('remote-only bindings recover from a local helper error without checking or repairing it', async (t) => {
+  let checks = 0
+  let repairs = 0
+  const vm = { id: 'vm-remote', node_id: 'node-a' }
+  const { pool, proxy } = await placedProxy(t, [vm], {
+    egressCheck: () => {
+      checks++
+      return { ok: false, reason: 'not_running' }
+    },
+    repairEgress: () => repairs++,
+  })
+  proxy.last_error = 'egress_down:not_running'
+  applyHold(vm, HOLD_PROXY, { tag: proxy.id, message: proxy.last_error })
+  assert.equal((await pool.probeById(proxy.id)).probe.ok, true)
+  assert.equal(vm.schedule_hold, undefined)
+  assert.equal(checks, 0)
+  assert.equal(repairs, 0)
+})
+
+test('a broken local helper holds only local bindings and releases old remote proxy holds', async (t) => {
+  const local = { id: 'vm-local' }
+  const remote = { id: 'vm-remote', node_id: 'node-a' }
+  const { pool, proxy } = await placedProxy(t, [local, remote])
+  proxy.last_error = 'egress_down:not_running'
+  applyHold(remote, HOLD_PROXY, { tag: proxy.id, message: proxy.last_error })
+  await pool.probeById(proxy.id)
+  assert.equal(local.schedule_hold?.reason, HOLD_PROXY)
+  assert.equal(remote.schedule_hold, undefined)
+  assert.equal(proxy.enabled, true)
+})
+
+test('a true SOCKS failure holds all bindings and recovery releases remote slots despite a local helper failure', async (t) => {
+  const local = { id: 'vm-local' }
+  const remote = { id: 'vm-remote', node_id: 'node-a' }
+  const { pool, proxy } = await placedProxy(t, [local, remote])
+  const port = proxy.port
+  // A closed TCP port is a real upstream failure, independent of either helper.
+  const closed = net.createServer()
+  await new Promise((resolve) => closed.listen(0, '127.0.0.1', resolve))
+  proxy.port = closed.address().port
+  await new Promise((resolve) => closed.close(resolve))
+  await pool.probeById(proxy.id)
+  await pool.probeById(proxy.id)
+  assert.equal(proxy.enabled, false)
+  assert.equal(local.schedule_hold?.reason, HOLD_PROXY)
+  assert.equal(remote.schedule_hold?.reason, HOLD_PROXY)
+  proxy.port = port
+  await pool.probeAll()
+  assert.equal(proxy.enabled, true)
+  assert.equal(proxy.consecutive_failures, 0)
+  assert.equal(local.schedule_hold?.reason, HOLD_PROXY)
+  assert.equal(remote.schedule_hold, undefined)
+})
+
+test('placement-aware probes do not treat deleted or unknown bindings as local slots', async (t) => {
+  let checks = 0
+  const { pool, proxy } = await placedProxy(t, [], {
+    egressCheck: () => {
+      checks++
+      return { ok: false, reason: 'not_running' }
+    },
+  })
+  pool.bind(proxy.id, 'vm-deleted')
+  assert.equal((await pool.probeById(proxy.id)).probe.ok, true)
+  assert.equal(checks, 0)
+})
+
+test('a slot migrated during local egress repair is not held by the stale local result', async (t) => {
+  const vm = { id: 'vm-moving', node_id: null }
+  const { pool, proxy } = await placedProxy(t, [vm], {
+    repairEgress: async () => {
+      vm.node_id = 'node-a'
+    },
+  })
+  const result = await pool.probeById(proxy.id)
+  assert.equal(result.probe.ok, true)
+  assert.equal(proxy.last_error, null)
+  assert.equal(vm.schedule_hold, undefined)
+})
+
+test('local egress result application respects cascade false for every placement', async (t) => {
+  const local = { id: 'vm-local' }
+  const remote = { id: 'vm-remote', node_id: 'node-a' }
+  const { pool, proxy } = await placedProxy(t, [local, remote])
+  applyHold(remote, HOLD_PROXY, { tag: proxy.id, message: 'egress_down:not_running' })
+  const before = structuredClone(remote.schedule_hold)
+  pool._applyProbeResult(proxy, await pool.probeOne(proxy), { cascade: false })
+  assert.equal(local.schedule_hold, undefined)
+  assert.deepEqual(remote.schedule_hold, before)
+})
+
+test('local helper recovery clears only matching proxy holds and preserves manual scheduling controls', async (t) => {
+  const local = { id: 'vm-local' }
+  const remoteOff = { id: 'vm-off', node_id: 'node-a', schedule_off: true }
+  const remoteOther = { id: 'vm-other', node_id: 'node-b' }
+  const { pool, proxy } = await placedProxy(t, [local, remoteOff, remoteOther])
+  proxy.last_error = 'egress_down:not_running'
+  applyHold(remoteOff, HOLD_PROXY, { tag: proxy.id })
+  applyHold(remoteOther, HOLD_PROXY, { tag: 'other-proxy' })
+  await pool.probeById(proxy.id)
+  assert.equal(remoteOff.schedule_hold, undefined)
+  assert.equal(remoteOff.schedule_off, true)
+  assert.equal(remoteOff.schedulable, false)
+  assert.equal(remoteOther.schedule_hold.detail.tag, 'other-proxy')
+})
+
+test('manual proxy disable survives old failures, reloads and late probe results', async (t) => {
+  const local = { id: 'vm-local' }
+  const remote = { id: 'vm-remote', node_id: 'node-a' }
+  let repairs = 0
+  const { pool, proxy } = await placedProxy(t, [local, remote], { repairEgress: () => repairs++ })
+  await pool.probeById(proxy.id)
+  assert.match(proxy.last_error, /egress_down/)
+  pool.setEnabled(proxy.id, false)
+  pool.reload()
+  const row = pool.state.proxies.find((p) => p.id === proxy.id)
+  for (const result of [
+    { ok: false, scope: 'egress', error: 'not_running', latency_ms: 1 },
+    { ok: false, scope: 'socks', error: 'ECONNRESET', latency_ms: null },
+    { ok: true, scope: 'socks', latency_ms: 1 },
+  ]) {
+    pool._applyProbeResult(row, result)
+    assert.equal(row.enabled, false)
+    assert.equal(remote.schedule_hold.detail.message, 'proxy_manually_disabled')
+  }
+  const previousRepairs = repairs
+  assert.equal((await pool.probeAll()).total, 0)
+  await pool.probeById(row.id)
+  assert.equal(repairs, previousRepairs)
+  assert.equal(row.enabled, false)
+  pool.setEnabled(row.id, true)
+  await pool.probeById(row.id)
+  assert.equal(row.enabled, true)
+  assert.equal(repairs, previousRepairs + 1)
+})
+
+test('disabling during the SOCKS probe prevents a later local helper repair', async (t) => {
+  let repairs = 0
+  const { pool, proxy } = await placedProxy(t, [{ id: 'vm-local' }], { repairEgress: () => repairs++ })
+  const probe = pool._probeSocks.bind(pool)
+  const completed = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  pool._probeSocks = async (row) => {
+    const result = await probe(row)
+    completed.resolve()
+    await release.promise
+    return result
+  }
+  const pending = pool.probeById(proxy.id)
+  await completed.promise
+  pool.setEnabled(proxy.id, false)
+  release.resolve()
+  await pending
+  assert.equal(repairs, 0)
+  assert.equal(proxy.enabled, false)
 })
 
 test('TCP connect without a SOCKS5 reply is not healthy', async () => {

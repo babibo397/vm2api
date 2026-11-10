@@ -165,6 +165,10 @@ export function proxyHasVm(proxy, vmId) {
   return boundVmIdsOf(proxy).includes(String(vmId))
 }
 
+function manuallyDisabled(proxy) {
+  return proxy.enabled === false && proxy.status === 'dead' && !proxy.last_error
+}
+
 /**
  * Flat `geo_*` columns -> one nested object, or null when the row was never
  * resolved. A failed lookup still returns an object (carrying `error`) so the
@@ -887,6 +891,9 @@ export class ProxyPool extends EventEmitter {
     p.enabled = !!enabled
     if (!enabled) {
       p.status = 'dead'
+      // A manual stop is not a failed probe eligible for automatic recovery.
+      // Persist this distinction using probeAll's existing no-error dead state.
+      p.last_error = null
       this._cascadeDisableVm(p, 'proxy_manually_disabled')
     } else {
       p.status = 'unknown'
@@ -1074,9 +1081,15 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
-  _cascadeDisableVm(proxy, reason) {
+  _localEgressVmIds(proxy) {
+    // Without a placement resolver, retain local-only installs' bound-slot behavior.
+    // With one, null means local; undefined means missing/unknown, not local.
+    return boundVmIdsOf(proxy).filter((id) => !this.vmNodeOf || this._vmNodeOrUndefined(id) === null)
+  }
+
+  _cascadeDisableVm(proxy, reason, vmIds = boundVmIdsOf(proxy)) {
     if (typeof this.onDisableVm !== 'function') return
-    for (const vmId of boundVmIdsOf(proxy)) {
+    for (const vmId of vmIds) {
       try {
         this.onDisableVm(vmId, reason, proxy.id)
       } catch {
@@ -1085,9 +1098,9 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
-  _cascadeEnableVm(proxy, reason) {
+  _cascadeEnableVm(proxy, reason, vmIds = boundVmIdsOf(proxy)) {
     if (typeof this.onEnableVm !== 'function') return
-    for (const vmId of boundVmIdsOf(proxy)) {
+    for (const vmId of vmIds) {
       try {
         this.onEnableVm(vmId, reason, proxy.id)
       } catch {
@@ -1101,6 +1114,9 @@ export class ProxyPool extends EventEmitter {
    * an HTTP port that accepts the socket and never answers 0x05 is a failure.
    */
   async probeOne(proxy) {
+    if (manuallyDisabled(proxy)) {
+      return { ok: false, scope: 'disabled', error: 'proxy_manually_disabled', latency_ms: null }
+    }
     const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, scope: 'policy', error: blocked, latency_ms: null }
     if (isLocalEgressProxy(proxy)) {
@@ -1122,9 +1138,16 @@ export class ProxyPool extends EventEmitter {
       }
     }
     const socks = await this._probeSocks(proxy)
+    if (manuallyDisabled(proxy)) {
+      return { ok: false, scope: 'disabled', error: 'proxy_manually_disabled', latency_ms: null }
+    }
     if (socks.scope === 'policy') return socks
     if (!socks.ok) return { ...socks, scope: 'socks' }
-    if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
+    // Node helpers belong to remote slot lifecycle/diagnostics. A missing control-plane
+    // helper says nothing about those slots, or about an imported but unused proxy.
+    if (typeof this.egressCheck !== 'function' || !this._localEgressVmIds(proxy).length) {
+      return { ...socks, scope: 'socks' }
+    }
     let eg = this.egressCheck(proxy)
     if (!eg?.ok && typeof this.repairEgress === 'function') {
       try {
@@ -1132,6 +1155,8 @@ export class ProxyPool extends EventEmitter {
       } catch {
         /* keep egress failure */
       }
+      // Bindings/placement can change while repair is awaiting external work.
+      if (!this._localEgressVmIds(proxy).length) return { ...socks, scope: 'socks' }
       eg = this.egressCheck(proxy)
     }
     if (eg?.ok) return { ...socks, scope: 'socks' }
@@ -1544,6 +1569,8 @@ export class ProxyPool extends EventEmitter {
   }
 
   _applyProbeResultInner(p, result, { cascade = true } = {}) {
+    // An operator may disable the row while a network probe/repair is in flight.
+    if (manuallyDisabled(p) || result.scope === 'disabled') return
     // Disabled by policy is not a failed probe and must not damage health/history.
     if (result.scope === 'policy' || proxyBlockedReason(p, this.state.config.ipv6_enabled)) return
     if (result.scope === 'pending') return
@@ -1557,17 +1584,32 @@ export class ProxyPool extends EventEmitter {
       p.last_error = result.error || 'node_unreachable'
       return
     }
+    const resume =
+      /egress_down|proxy_probe_failed/.test(String(p.last_error || '')) ||
+      p.status === 'fail' ||
+      (p.status === 'dead' && !!p.last_error)
     if (result.scope === 'egress') {
+      const localVmIds = this._localEgressVmIds(p)
+      if (!localVmIds.length) {
+        // A local consumer may have moved or unbound since the async probe finished.
+        return this._applyProbeResultInner(p, { ok: true, scope: 'socks', latency_ms: result.latency_ms }, { cascade })
+      }
       p.last_error = `egress_down:${result.error || 'down'}`
+      // SOCKS recovered even when this machine's helper did not. Keep a local
+      // runtime fault from leaving a shared proxy disabled for remote consumers.
+      p.consecutive_failures = 0
+      if (resume && !p.enabled) p.enabled = true
       if (p.enabled) p.status = 'ok'
-      if (cascade) this._cascadeDisableVm(p, p.last_error)
+      if (cascade) {
+        this._cascadeDisableVm(p, p.last_error, localVmIds)
+        if (resume && p.enabled) {
+          const remoteVmIds = boundVmIdsOf(p).filter((id) => !!this._vmNodeOrUndefined(id))
+          this._cascadeEnableVm(p, 'proxy_recovered', remoteVmIds)
+        }
+      }
       return
     }
     if (result.ok) {
-      const resume =
-        /egress_down|proxy_probe_failed/.test(String(p.last_error || '')) ||
-        p.status === 'fail' ||
-        (p.status === 'dead' && !!p.last_error)
       p.status = 'ok'
       p.consecutive_failures = 0
       p.last_error = null
