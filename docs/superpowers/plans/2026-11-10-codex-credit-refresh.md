@@ -9,20 +9,22 @@
 **Tradeoff:** Background refresh keeps both the UI and admission state fresh; extending the TTL would conceal stale balances, and request-time-only refresh would leave the UI restricted until traffic arrives. The user authorized this targeted automatic-refresh repair and deployment.
 
 ## Task 1: Monitor and regression coverage
-- [ ] Add failing tests in `test/unit/codex-quota-monitor.test.mjs` covering the observed stale-credit/7d-full case through real quota persistence and admission; five-minute proactive refresh; false/zero credit results; query failure retry; concurrency/overlap; manual-off/proxy/credential exclusions and quota-restricted inclusion; lifecycle stop.
-- [ ] Implement `createCodexQuotaMonitor({ listTargets, queryQuota, now, log })` in `src/lib/oauth/codex-quota-monitor.mjs`, exposing `tick`, `start`, and `stop`.
-- [ ] Run the new tests plus existing Codex credits, quota, usage and slot pool tests using the deployed Node 22 runtime.
+- [x] Add failing tests in `test/unit/codex-quota-monitor.test.mjs` covering the observed stale-credit/7d-full case through real quota persistence and admission; five-minute proactive refresh; false/zero credit results; query failure retry; concurrency/overlap; manual-off/proxy/credential exclusions and quota-restricted inclusion; lifecycle stop.
+- [x] Implement `createCodexQuotaMonitor({ listTargets, queryQuota, now, log })` in `src/lib/oauth/codex-quota-monitor.mjs`, exposing `tick`, `start`, and `stop`.
+- [x] Run the new tests plus existing Codex credits, quota, usage and slot pool tests using the deployed Node 22 runtime.
 
 ## Task 2: Integrate and release
-- [ ] Wire server startup/shutdown and dynamic `routingConfig.codex.quota` into the monitor, invoking `queryOpenaiQuota` with `rotate: false`.
-- [ ] Extend the pinned official-image overlay to copy the new monitor and server integration.
-- [ ] Independently review the change, then merge local main and push the fork while preserving unrelated local work.
-- [ ] Build/push amd64 to `hx-repo.tencentcloudcr.com/devops/vm2api`, verify synchronized pull from `hx-repo-xjp.tencentcloudcr.com/devops/vm2api`.
-- [ ] Back up live state; deploy by immutable digest using `regcred`, retaining both `nodetype=new-api` and hostname affinity for `.131`/`.141`, one replica and Recreate.
-- [ ] Verify health, code hashes, startup credit refresh, a second automatic refresh, scheduling and reset-credit count. Record rollback and verification evidence.
+- [x] Wire server startup/shutdown and dynamic `routingConfig.codex.quota` into the monitor, invoking `queryOpenaiQuota` with `rotate: false`.
+- [x] Extend the pinned official-image overlay to copy the new monitor and server integration.
+- [x] Independently review the change, then merge local main and push the fork while preserving unrelated local work.
+- [x] Build/push amd64 to `hx-repo.tencentcloudcr.com/devops/vm2api`, verify synchronized pull from `hx-repo-xjp.tencentcloudcr.com/devops/vm2api`.
+- [x] Back up live state; deploy by immutable digest using `regcred`, retaining both `nodetype=new-api` and hostname affinity for `.131`/`.141`, one replica and Recreate.
+- [x] Verify health, code hashes, startup credit refresh, a second automatic refresh, scheduling and reset-credit count. Record rollback and verification evidence.
 
 **Review focus:** failed requests preserve fail-closed behavior; quota-blocked slots remain refresh targets; manual disable is never reopened; bad proxies never cause direct fallback; no overlapping/unbounded refresh work or token rotation race.
 
 **Review refinements:** Exclude GPT slots from the optional generic usage monitor so the dedicated monitor owns background GPT quota queries. Authentication failures back off for five minutes; normal failures retry no faster than once per minute. Keep `rotate: false`: the Codex kernel owns automatic token rotation and writes the same credentials file, so the monitor must not introduce a competing refresh-token writer.
 
 **Deadline correction:** Quota requests must remain abortable until their response bodies are fully read. A stalled JSON body must return a timeout, close its stream, preserve the old credit reading and release the monitor pass so later accounts and ticks can continue. Compose the quota request's abort signal with the existing proxy fetch timeout and add a real partial-response HTTP regression.
+
+**Completion:** Runtime source 97950d71 deployed as revision 7. The actual Node 22 image passed 120 related tests. Startup and subsequent automatic quota refresh were observed at 19:06:17 and 19:12:16 Asia/Shanghai while inference traffic and reset-credit count remained unchanged; vm-01 stayed schedulable. Verification and rollback evidence: `/Users/xy/.config/vm2api/reports/codex-credit-refresh-20261110/verification.md`.
