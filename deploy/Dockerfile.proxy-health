@@ -1,19 +1,24 @@
-# Official v1.4.061 Linux amd64 release, with remote-slot and credit-refresh fixes.
+# Official v1.4.061 Linux amd64 release, with remote-slot, credit and lifecycle fixes.
 # Keep the base pinned so the image is reproducible and rollback is unambiguous.
 FROM ghcr.io/dofastted/vm2api:v1.4.061@sha256:a6be74b4a4ce970bb30f96a07853bf61d8f1c02e5c165b16e5f80bec1bd0a55d
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/babibo397/vm2api" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
-      org.opencontainers.image.version="1.4.061-credit-refresh"
+      org.opencontainers.image.version="1.4.061-slot-lifecycle"
 COPY src/server.mjs /opt/vm2api/src/server.mjs
 COPY src/lib/oauth/codex-quota-monitor.mjs src/lib/oauth/openai-quota.mjs /opt/vm2api/src/lib/oauth/
 COPY src/lib/protocol/codex-models.mjs /opt/vm2api/src/lib/protocol/codex-models.mjs
-COPY src/lib/vm/proxy-pool.mjs /opt/vm2api/src/lib/vm/proxy-pool.mjs
+COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
+COPY src/lib/admin/panel-routes.mjs /opt/vm2api/src/lib/admin/panel-routes.mjs
+COPY src/lib/vm/proxy-pool.mjs src/lib/vm/slot-runtime.mjs /opt/vm2api/src/lib/vm/
 COPY src/lib/cluster/slot-image.mjs src/lib/cluster/remote-slot-files.mjs src/lib/cluster/remote-slot.mjs /opt/vm2api/src/lib/cluster/
 RUN node --check /opt/vm2api/src/server.mjs \
   && node --check /opt/vm2api/src/lib/oauth/codex-quota-monitor.mjs \
   && node --check /opt/vm2api/src/lib/oauth/openai-quota.mjs \
   && node --check /opt/vm2api/src/lib/protocol/codex-models.mjs \
+  && node --check /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs \
+  && node --check /opt/vm2api/src/lib/admin/panel-routes.mjs \
+  && node --check /opt/vm2api/src/lib/vm/slot-runtime.mjs \
   && node --check /opt/vm2api/src/lib/vm/proxy-pool.mjs \
   && node --check /opt/vm2api/src/lib/cluster/slot-image.mjs \
   && node --check /opt/vm2api/src/lib/cluster/remote-slot-files.mjs \

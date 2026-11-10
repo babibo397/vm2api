@@ -12,11 +12,19 @@ import {
   stopCodexKernelAndWait,
   writeCodexKernelConfig,
 } from '../../src/lib/transport/codex-kernel-supervisor.mjs'
-import { reloadSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
+import { destroySlot, reloadSlotReady, startSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
+import { recreateVmFiles } from '../../src/lib/vm/vm-recreate.mjs'
+import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
-async function fixture(t) {
+async function fixture(t, { exitDelayMs = 0 } = {}) {
   // Keep the Unix-socket path below macOS's length limit.
   const root = fs.mkdtempSync('/tmp/ck-reload-')
+  const previousPath = process.env.PATH
+  const mockBin = path.join(root, 'bin')
+  fs.mkdirSync(mockBin)
+  // No lifecycle test may contact the developer's real Docker daemon.
+  fs.writeFileSync(path.join(mockBin, 'docker'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  process.env.PATH = `${mockBin}:${previousPath}`
   const bin = path.join(root, 'kernel')
   fs.writeFileSync(
     bin,
@@ -30,7 +38,10 @@ const server = http.createServer((req, res) => {
 })
 server.listen(config.socket_path)
 process.on('SIGTERM', () => {
-  setTimeout(() => server.close(() => process.exit(0)), 100)
+  setTimeout(() => server.close(() => {
+    fs.writeFileSync(config.socket_path + '.closed', String(process.pid))
+    setTimeout(() => process.exit(0), ${exitDelayMs})
+  }), 100)
 })
 `,
     { mode: 0o755 },
@@ -45,6 +56,7 @@ process.on('SIGTERM', () => {
     }
     if (previousBin === undefined) delete process.env.KIN_CODEX_KERNEL_BIN
     else process.env.KIN_CODEX_KERNEL_BIN = previousBin
+    process.env.PATH = previousPath
     fs.rmSync(root, { recursive: true, force: true })
   })
   return {
@@ -180,3 +192,251 @@ test('GPT reload reports a failed stop without starting another kernel', async (
   assert.equal(starts, 0)
   assert.equal((await codexKernelHealth(first.exec)).pid, first.health.pid)
 })
+
+test('Codex destruction waits for the host kernel before home recreation and a replacement stays reachable', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-reset')
+  const peer = await f.slot('vm-peer')
+  let destroyed = false
+  let rebuilt
+  const gone = await destroySlot(first.vm, f.root, {
+    afterDestroy: () => {
+      rebuilt = recreateVmFiles(f.root, first.vm, { mode: 'keep' })
+    },
+    ops: {
+      destroySlot: async () => {
+        assert.equal(codexKernelTracked(first.vm.id), false, 'host exit must precede container destruction')
+        assert.throws(() => process.kill(first.health.pid, 0), { code: 'ESRCH' })
+        destroyed = true
+        return { ok: true, action: 'removed' }
+      },
+    },
+  })
+  assert.equal(gone.ok, true)
+  assert.equal(codexKernelTracked(first.vm.id), false, 'destruction must not leave the old host process alive')
+  assert.equal(destroyed, true)
+  const boot = await startSlotReady(rebuilt.vm, f.root, {
+    ops: { startSlot: async () => ({ ok: true, action: 'created', runtime: rebuilt.vm.runtime }) },
+  })
+  assert.equal(boot.ok, true)
+  const current = await codexKernelHealth(first.exec)
+  assert.equal(current.ok, true)
+  assert.notEqual(current.pid, first.health.pid)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', first.vm.id, 'run', 'codex-kernel.sock')), true)
+  assert.equal((await codexKernelHealth(peer.exec)).pid, peer.health.pid)
+})
+
+test('destruction blocks concurrent ensure until the host and local home have both been removed', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-held')
+  let entered
+  const inDestroy = new Promise((resolve) => {
+    entered = resolve
+  })
+  let finishDestroy
+  const gate = new Promise((resolve) => {
+    finishDestroy = resolve
+  })
+  let wiped = false
+  const deleting = destroySlot(first.vm, f.root, {
+    ops: {
+      destroySlot: async () => {
+        entered()
+        await gate
+        return { ok: true }
+      },
+    },
+    afterDestroy: async () => {
+      assert.deepEqual(await ensureCodexKernel(first.exec), { ok: false, reason: 'teardown_in_progress' })
+      fs.rmSync(path.join(f.root, 'vms', first.vm.id, 'run'), { recursive: true, force: true })
+      wiped = true
+    },
+  })
+  await inDestroy
+  try {
+    assert.deepEqual(await ensureCodexKernel(first.exec), { ok: false, reason: 'teardown_in_progress' })
+    let duplicateDestroys = 0
+    const duplicate = await destroySlot(first.vm, f.root, {
+      ops: {
+        destroySlot: async () => {
+          duplicateDestroys += 1
+          return { ok: true }
+        },
+      },
+      afterDestroy: () => {
+        duplicateDestroys += 1
+      },
+    })
+    assert.equal(duplicate.ok, false)
+    assert.equal(duplicate.code, 'codex_kernel_destroy_failed')
+    assert.equal(duplicateDestroys, 0, 'a second teardown must not run destructive callbacks')
+  } finally {
+    finishDestroy()
+    await deleting
+  }
+  assert.equal(wiped, true)
+  assert.equal(codexKernelTracked(first.vm.id), false)
+  writeCodexKernelConfig(f.root, first.vm)
+  assert.equal((await ensureCodexKernel(first.exec)).ok, true)
+  assert.notEqual((await codexKernelHealth(first.exec)).pid, first.health.pid)
+})
+
+test('an ensure already waiting on health cannot spawn after a completed teardown', async (t) => {
+  const f = await fixture(t)
+  const vm = { id: 'vm-old-ensure', platform: 'openai' }
+  const exec = { vmId: vm.id, vm, homeDir: path.join(f.root, 'vms', vm.id, 'cli-home') }
+  writeCodexKernelConfig(f.root, vm)
+  t.after(async () => {
+    const child = stopCodexKernel(vm.id)
+    if (child) await finishCodexRecycle(child)
+  })
+  // With no socket, ensure waits for its health deadline before attempting a spawn.
+  const pending = ensureCodexKernel(exec, { timeoutMs: 300 })
+  const gone = await destroySlot(vm, f.root, {
+    ops: { destroySlot: async () => ({ ok: true }) },
+    afterDestroy: () => fs.rmSync(path.join(f.root, 'vms', vm.id), { recursive: true, force: true }),
+  })
+  assert.equal(gone.ok, true)
+  const result = await pending
+  assert.deepEqual(result, { ok: false, reason: 'teardown_in_progress' })
+  assert.equal(codexKernelTracked(vm.id), false)
+})
+
+test('destruction joins a body-limit recycle until its old process exits and cannot unlink the replacement socket', async (t) => {
+  const f = await fixture(t, { exitDelayMs: 1400 })
+  const first = await f.slot('vm-recycle-delete')
+  const runDir = path.join(f.root, 'vms', first.vm.id, 'run')
+  const configPath = path.join(runDir, 'codex-kernel.json')
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+  config.max_request_bytes *= 2
+  fs.writeFileSync(configPath, JSON.stringify(config))
+  const recycling = ensureCodexKernel(first.exec)
+  const closedMarker = path.join(runDir, 'codex-kernel.sock.closed')
+  const deadline = Date.now() + 3000
+  while (!fs.existsSync(closedMarker) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.equal(fs.existsSync(closedMarker), true, 'the old kernel must close its listener before teardown starts')
+  assert.doesNotThrow(() => process.kill(first.health.pid, 0), 'the old kernel must still be exiting')
+  let destroyedWhileRunning = false
+  const gone = await destroySlot(first.vm, f.root, {
+    ops: {
+      destroySlot: async () => {
+        try {
+          process.kill(first.health.pid, 0)
+          destroyedWhileRunning = true
+        } catch (error) {
+          assert.equal(error.code, 'ESRCH')
+        }
+        return { ok: true }
+      },
+    },
+    afterDestroy: () => fs.rmSync(runDir, { recursive: true, force: true }),
+  })
+  assert.equal(gone.ok, true)
+  writeCodexKernelConfig(f.root, first.vm)
+  assert.equal((await ensureCodexKernel(first.exec, { timeoutMs: 500 })).ok, true)
+  const replacement = await codexKernelHealth(first.exec)
+  assert.notEqual(replacement.pid, first.health.pid)
+  assert.deepEqual(await recycling, { ok: false, reason: 'teardown_in_progress' })
+  const current = await codexKernelHealth(first.exec)
+  assert.equal(current.ok, true, 'old recycle cleanup must not unlink the replacement socket')
+  assert.equal(current.pid, replacement.pid)
+  assert.equal(destroyedWhileRunning, false, 'host destruction must wait for the old process to exit')
+})
+
+test('a failed Codex stop prevents host destruction and preserves its live socket', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-no-stop')
+  let destroys = 0
+  const gone = await destroySlot(first.vm, f.root, {
+    ops: {
+      stopCodexKernelAndWait: async () => ({ ok: false, reason: 'recycle_timeout' }),
+      destroySlot: async () => {
+        destroys += 1
+        return { ok: true }
+      },
+    },
+  })
+  assert.equal(gone.ok, false)
+  assert.equal(gone.code, 'codex_kernel_destroy_failed')
+  assert.equal(destroys, 0)
+  assert.equal((await codexKernelHealth(first.exec)).pid, first.health.pid)
+  assert.equal((await ensureCodexKernel(first.exec)).ok, true, 'a failed stop must release the teardown hold')
+})
+
+test('Codex destruction without a project root refuses to destroy an unverifiable kernel', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-no-root')
+  const gone = await destroySlot(first.vm)
+  assert.equal(gone.ok, false)
+  assert.equal(gone.code, 'codex_kernel_destroy_failed')
+  assert.equal((await codexKernelHealth(first.exec)).pid, first.health.pid)
+})
+
+test('Claude destruction retains the ordinary container-only result', async (t) => {
+  await fixture(t)
+  const gone = await destroySlot({ id: 'vm-claude', platform: 'anthropic' }, null, {
+    ops: {
+      stopCodexKernelAndWait: () => {
+        throw new Error('Claude must not stop a Codex kernel')
+      },
+    },
+  })
+  assert.equal(gone.ok, true)
+  assert.equal(gone.action, 'absent')
+})
+
+for (const action of ['reset', 'delete']) {
+  test(`panel ${action} preserves the record and home when a Codex listener cannot be stopped`, async (t) => {
+    const f = await fixture(t)
+    const vm = { id: 'vm-owned', platform: 'openai', runtime: { type: 'docker' } }
+    const vmPath = path.join(f.root, 'vms', `${vm.id}.json`)
+    fs.mkdirSync(path.dirname(vmPath), { recursive: true })
+    fs.writeFileSync(vmPath, JSON.stringify(vm))
+    const written = writeCodexKernelConfig(f.root, vm)
+    const marker = path.join(f.root, 'vms', vm.id, 'must-survive')
+    fs.writeFileSync(marker, 'fixture-data')
+    const server = http.createServer((_req, res) => res.end(JSON.stringify({ ok: true })))
+    await new Promise((resolve) => server.listen(written.socketPath, resolve))
+    let unbound = false
+    const response = {}
+    const handle = createPanelHandler({
+      cfg: { paths: { project: f.root } },
+      requireAuth(req) {
+        req.apiKeyKind = 'master'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        response.status = status
+        response.body = body
+        return true
+      },
+      readBody: async () => ({ mode: 'keep' }),
+      proxyPool: {
+        unbindVm() {
+          unbound = true
+        },
+        allocateForVm() {
+          return null
+        },
+      },
+    })
+    try {
+      await handle(
+        { method: action === 'reset' ? 'POST' : 'DELETE' },
+        {},
+        new URL(`http://localhost/api/panel/vms/${vm.id}${action === 'reset' ? '/reset' : ''}`),
+      )
+      assert.equal(response.status, action === 'reset' ? 500 : 409)
+      assert.equal(response.body.error.code, 'codex_kernel_destroy_failed')
+      assert.equal(fs.readFileSync(marker, 'utf8'), 'fixture-data')
+      assert.equal(fs.existsSync(vmPath), true)
+      assert.equal(fs.existsSync(written.socketPath), true)
+      assert.equal(unbound, false)
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  })
+}

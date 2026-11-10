@@ -16,6 +16,23 @@ import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/co
 
 const starts = new Map()
 const stops = new Map()
+const teardowns = new Set()
+const lifecycleEpochs = new Map()
+
+/** Keep lazy starts out until destruction and its local-file cleanup finish. */
+export async function withCodexKernelTeardown(exec, action) {
+  const vmId = exec?.vmId
+  if (teardowns.has(vmId)) {
+    return { ok: false, code: 'codex_kernel_destroy_failed', error: 'Codex kernel teardown is already in progress' }
+  }
+  teardowns.add(vmId)
+  lifecycleEpochs.set(vmId, Symbol())
+  try {
+    return await action()
+  } finally {
+    teardowns.delete(vmId)
+  }
+}
 
 // The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
 function kernelEnv(env = process.env) {
@@ -207,9 +224,15 @@ export function stopCodexKernelAndWait(exec, opts = {}) {
 }
 
 export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
+  const vmId = exec?.vmId
+  const epoch = lifecycleEpochs.get(vmId)
+  const invalidated = () => teardowns.has(vmId) || lifecycleEpochs.get(vmId) !== epoch
+  const teardown = { ok: false, reason: 'teardown_in_progress' }
+  if (invalidated()) return teardown
   const stopping = stops.get(exec?.vmId)
   if (stopping) {
     const stopped = await stopping
+    if (invalidated()) return teardown
     if (!stopped.ok) return stopped
   }
   const bin = codexKernelBinPath()
@@ -222,19 +245,18 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   // Only the request that holds this seat may recycle. A timeout is not an
   // exit: leave the socket and the tracked child in place.
   if (shouldRecycleCodexKernel({ wanted, stamped, inFlight })) {
-    const child = stopCodexKernel(exec.vmId)
-    if (child) {
-      const gone = await finishCodexRecycle(child, paths.socketPath)
-      if (!gone.exited) {
-        starts.set(exec.vmId, child)
-        return { ok: false, reason: 'recycle_timeout' }
-      }
-    }
+    const stopped = await stopCodexKernelAndWait(exec)
+    if (invalidated()) return teardown
+    if (!stopped.ok) return stopped
   }
   const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
+  if (invalidated()) return teardown
   if (live.ok) return { ok: true, reused: true, health: live.health }
   const current = starts.get(exec.vmId)
-  if (!childHasExited(current)) return waitForHealth(exec, timeoutMs)
+  if (!childHasExited(current)) {
+    const ready = await waitForHealth(exec, timeoutMs)
+    return invalidated() ? teardown : ready
+  }
   try {
     if (paths.socketPath) fs.unlinkSync(paths.socketPath)
   } catch {}
@@ -246,7 +268,8 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   child.unref()
   starts.set(exec.vmId, child)
   writeLimitStamp(paths.configPath, wanted)
-  return waitForHealth(exec, timeoutMs)
+  const ready = await waitForHealth(exec, timeoutMs)
+  return invalidated() ? teardown : ready
 }
 
 async function waitForHealth(exec, timeoutMs) {

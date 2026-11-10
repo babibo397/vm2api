@@ -14,6 +14,7 @@ import {
   ensureCodexKernel,
   stopCodexKernel,
   stopCodexKernelAndWait,
+  withCodexKernelTeardown,
   writeCodexKernelConfig,
 } from '../transport/codex-kernel-supervisor.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
@@ -72,9 +73,36 @@ export async function stopSlot(vm) {
   return slotHost(vm).stop(vm)
 }
 
-/** Destroy the slot container. Used only by explicit reset / delete. */
-export async function destroySlot(vm) {
-  return slotHost(vm).destroy(vm)
+/** Stop host inference before reset/delete may remove the container and its home. */
+export async function destroySlot(vm, projectRoot, opts = {}) {
+  const destroy = async () => {
+    const gone = await (opts.ops?.destroySlot ? opts.ops.destroySlot(vm) : slotHost(vm).destroy(vm))
+    if (gone?.ok && opts.afterDestroy) await opts.afterDestroy(gone)
+    return gone
+  }
+  if (isCodexVm(vm)) {
+    const exec = slotExec(projectRoot, vm)
+    if (!exec) {
+      return { ok: false, code: 'codex_kernel_destroy_failed', error: 'Codex kernel stop requires a project root' }
+    }
+    return withCodexKernelTeardown(exec, async () => {
+      try {
+        const stop = opts.ops?.stopCodexKernelAndWait || stopCodexKernelAndWait
+        const stopped = await stop(exec)
+        if (!stopped?.ok) {
+          return {
+            ok: false,
+            code: 'codex_kernel_destroy_failed',
+            error: 'Codex kernel must stop before slot destruction',
+          }
+        }
+      } catch {
+        return { ok: false, code: 'codex_kernel_destroy_failed', error: 'Codex kernel stop failed' }
+      }
+      return destroy()
+    })
+  }
+  return destroy()
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
