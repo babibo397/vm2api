@@ -15,19 +15,22 @@ and diagnosis remain owned by the existing remote slot lifecycle.
 
 ## Image
 
-`Dockerfile.proxy-health` uses the official Linux amd64 release by digest and
-replaces only the changed JavaScript modules. The upstream UI, binaries and
-entrypoint remain from that same release; no runtime ConfigMap source overlay
-is needed. Use a dedicated tag when sharing a repository with other services.
+Build the repository's official `Dockerfile` from the latest upstream source
+plus the remote-slot fixes. It rebuilds the console and open-source Go helpers;
+the remaining slot binaries are fetched and verified against the upstream
+`deploy/payload.json` release manifest. No runtime source overlay is needed.
 
 ```sh
 revision=$(git rev-parse HEAD)
 short_revision=$(git rev-parse --short=12 HEAD)
-tag="vm2api-v1.4.061-egress-$short_revision"
-docker buildx build --platform linux/amd64 \
-  -f deploy/Dockerfile.proxy-health --build-arg SOURCE_REVISION="$revision" \
+tag="vm2api-v1.4.061-source-$short_revision"
+docker buildx build --platform linux/amd64 --provenance=false \
+  -f Dockerfile --label "org.opencontainers.image.revision=$revision" \
   -t "hx-repo.tencentcloudcr.com/devops/vm2api:$tag" --push .
 ```
+
+`Dockerfile.proxy-health` remains an alternative overlay build based on the
+pinned official image; the source build above is the deployment procedure.
 
 For the synchronized Singapore registry, deploy the resulting image under
 `hx-repo-xjp.tencentcloudcr.com/devops/vm2api` using the same tag and

@@ -515,7 +515,7 @@ export function CreateVmForm({
             {
               value: 'openai',
               title: <PlatformChip kind='codex' />,
-              detail: 'Codex OAuth 或 auth.json。只能放在本机。',
+              detail: 'Codex OAuth 或 auth.json。支持本机与 Linux 集群节点。',
             },
           ]}
         />
