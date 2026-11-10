@@ -26,12 +26,16 @@ short_revision=$(git rev-parse --short=12 HEAD)
 tag="vm2api-v1.4.061-egress-$short_revision"
 docker buildx build --platform linux/amd64 \
   -f deploy/Dockerfile.proxy-health --build-arg SOURCE_REVISION="$revision" \
-  -t "hx-repo.tencentcloudcr.com/devops/new-api:$tag" --push .
+  -t "hx-repo.tencentcloudcr.com/devops/vm2api:$tag" --push .
 ```
 
 For the synchronized Singapore registry, deploy the resulting image under
-`hx-repo-xjp.tencentcloudcr.com/devops/new-api` using the same tag/digest and
-the namespace's `regcred` image pull secret. Keep one control-plane replica
+`hx-repo-xjp.tencentcloudcr.com/devops/vm2api` using the same tag and
+`spec.template.spec.imagePullSecrets: [{ name: regcred }]` on the Deployment.
+Verify the replicated manifest before pinning a digest: this registry currently
+serves the Linux amd64 child manifest but not the build's outer OCI index.
+Use the verified child digest, and validate the pull with a temporary Pod before
+replacing the running service. Keep one control-plane replica
 with `Recreate`, its existing PVC, database encryption secret, configuration
 and node scheduling constraints. Back up SQLite and VM/config files before
 upgrading; this upstream release adds no database migrations relative to
