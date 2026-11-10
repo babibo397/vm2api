@@ -265,26 +265,35 @@ async function loadSlot(projectRoot, vmId) {
 }
 
 async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchImpl, timeoutMs, direct = false } = {}) {
-  const fetchFn = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
+  const deadlineMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : OPENAI_QUOTA_TIMEOUT_MS
+  const fetchFn = fetchImpl || makeProxyFetch(proxyUrl, deadlineMs)
   if (!fetchImpl && !proxyUrl && !direct)
     return { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', status: 400 }
+  // Fetch resolves at headers; retain ownership until the complete JSON body arrives.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), deadlineMs)
   try {
     const res = await fetchFn(url, {
       method,
       headers,
+      signal: controller.signal,
       ...(body === undefined ? {} : { body }),
     })
     const status = Number(res?.status) || 0
     const payload = await readJson(res)
+    // readJson tolerates invalid JSON, but a cancelled body is never a successful sample.
+    controller.signal.throwIfAborted()
     return { ok: status > 0 && status < 400, status, payload }
   } catch (e) {
-    const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
+    const aborted = controller.signal.aborted || e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
     return {
       ok: false,
       error: aborted ? 'timeout' : 'fetch_failed',
       message: aborted ? '上游超时' : '上游请求失败',
       status: 502,
     }
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -319,7 +328,7 @@ function publicUsage(extra, resetCredits, credits, usagePayload = {}) {
   }
 }
 
-async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId, policy = null } = {}) {
+async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId, policy = null, timeoutMs } = {}) {
   if (!slot.proxyUrl && !fetchImpl && !slot.direct) {
     return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
   }
@@ -332,6 +341,7 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
       proxyUrl: current.proxyUrl,
       fetchImpl,
       direct: current.direct,
+      timeoutMs,
     })
     if (!usage.ok && usage.error) return usage
     if (usage.status === 401 || usage.status === 403) {
@@ -347,6 +357,7 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
       proxyUrl: current.proxyUrl,
       fetchImpl,
       direct: current.direct,
+      timeoutMs,
     })
     return { usage, details }
   }
@@ -399,10 +410,10 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   }
 }
 
-export async function queryOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null } = {}) {
+export async function queryOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null, timeoutMs } = {}) {
   const slot = await loadSlot(projectRoot, vmId)
   if (!slot.ok) return slot
-  return queryUpstream(slot, { fetchImpl, rotate, projectRoot, vmId, policy })
+  return queryUpstream(slot, { fetchImpl, rotate, projectRoot, vmId, policy, timeoutMs })
 }
 
 export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null } = {}) {

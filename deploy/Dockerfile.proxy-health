@@ -6,11 +6,14 @@ LABEL org.opencontainers.image.source="https://github.com/babibo397/vm2api" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.version="1.4.061-credit-refresh"
 COPY src/server.mjs /opt/vm2api/src/server.mjs
-COPY src/lib/oauth/codex-quota-monitor.mjs /opt/vm2api/src/lib/oauth/codex-quota-monitor.mjs
+COPY src/lib/oauth/codex-quota-monitor.mjs src/lib/oauth/openai-quota.mjs /opt/vm2api/src/lib/oauth/
+COPY src/lib/protocol/codex-models.mjs /opt/vm2api/src/lib/protocol/codex-models.mjs
 COPY src/lib/vm/proxy-pool.mjs /opt/vm2api/src/lib/vm/proxy-pool.mjs
 COPY src/lib/cluster/slot-image.mjs src/lib/cluster/remote-slot-files.mjs src/lib/cluster/remote-slot.mjs /opt/vm2api/src/lib/cluster/
 RUN node --check /opt/vm2api/src/server.mjs \
   && node --check /opt/vm2api/src/lib/oauth/codex-quota-monitor.mjs \
+  && node --check /opt/vm2api/src/lib/oauth/openai-quota.mjs \
+  && node --check /opt/vm2api/src/lib/protocol/codex-models.mjs \
   && node --check /opt/vm2api/src/lib/vm/proxy-pool.mjs \
   && node --check /opt/vm2api/src/lib/cluster/slot-image.mjs \
   && node --check /opt/vm2api/src/lib/cluster/remote-slot-files.mjs \

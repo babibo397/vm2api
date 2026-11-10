@@ -24,3 +24,5 @@
 **Review focus:** failed requests preserve fail-closed behavior; quota-blocked slots remain refresh targets; manual disable is never reopened; bad proxies never cause direct fallback; no overlapping/unbounded refresh work or token rotation race.
 
 **Review refinements:** Exclude GPT slots from the optional generic usage monitor so the dedicated monitor owns background GPT quota queries. Authentication failures back off for five minutes; normal failures retry no faster than once per minute. Keep `rotate: false`: the Codex kernel owns automatic token rotation and writes the same credentials file, so the monitor must not introduce a competing refresh-token writer.
+
+**Deadline correction:** Quota requests must remain abortable until their response bodies are fully read. A stalled JSON body must return a timeout, close its stream, preserve the old credit reading and release the monitor pass so later accounts and ticks can continue. Compose the quota request's abort signal with the existing proxy fetch timeout and add a real partial-response HTTP regression.
