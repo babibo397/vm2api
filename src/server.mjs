@@ -32,6 +32,8 @@ import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
+import { createCodexQuotaMonitor } from './lib/oauth/codex-quota-monitor.mjs'
+import { queryOpenaiQuota } from './lib/oauth/openai-quota.mjs'
 import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
@@ -181,6 +183,7 @@ let credentialRefreshMonitor = null
 let kernelWatchdog = null
 let cliNodeGuard = null
 let usageProbeMonitor = null
+let codexQuotaMonitor = null
 let catalogMonitor = null
 let notifyMonitor = null
 
@@ -517,7 +520,7 @@ kernelWatchdog = createKernelWatchdog({
 
 usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
-  listTargets: () => listVms(cfg.paths.project),
+  listTargets: () => listVms(cfg.paths.project).filter((vm) => !isCodexVm(vm)),
   accountForVm: accountForUsageProbe,
   isActive: usageProbeActive,
   reconcile: (vm, account) => {
@@ -538,6 +541,17 @@ usageProbeMonitor = createUsageProbeMonitor({
     } catch {}
   },
   probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
+})
+codexQuotaMonitor = createCodexQuotaMonitor({
+  listTargets: () => listVms(cfg.paths.project),
+  queryQuota: (vm) =>
+    queryOpenaiQuota({
+      projectRoot: cfg.paths.project,
+      vmId: vm.id,
+      rotate: false,
+      policy: routingConfig.codex?.quota,
+    }),
+  log: (event) => console.log(JSON.stringify(event)),
 })
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
@@ -1053,6 +1067,9 @@ const gracefulShutdown = createGracefulShutdown({
       usageProbeMonitor?.stop?.()
     } catch {}
     try {
+      codexQuotaMonitor?.stop?.()
+    } catch {}
+    try {
       catalogMonitor?.stop?.()
     } catch {}
     try {
@@ -1368,8 +1385,13 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[usage-probe] start failed', e?.message || e)
   }
-  // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
+  // The KIN_CRS_MOCK harness promises no outbound network.
   if (process.env.KIN_CRS_MOCK !== '1') {
+    try {
+      codexQuotaMonitor?.start?.()
+    } catch (e) {
+      console.warn('[codex-quota] start failed', e?.message || e)
+    }
     try {
       catalogMonitor?.start?.()
     } catch (e) {
