@@ -1,0 +1,24 @@
+{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "vm2api",
+            "image": "hx-repo-xjp.tencentcloudcr.com/devops/vm2api@sha256:d5dcf561c437214a79dec1db1940dbfd84dbaf4b3be6ed2b9e1441ac66af327f",
+            "resources": {
+              "requests": {
+                "cpu": "500m",
+                "memory": "2Gi"
+              },
+              "limits": {
+                "cpu": "2",
+                "memory": "3Gi"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

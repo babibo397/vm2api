@@ -1,0 +1,50 @@
+# Intended isolation only until enforcement is verified. The observed TKE
+# route-ENI configuration has Cilium disabled and no policy agent was found.
+# Applying this object is not proof of enforced egress isolation; see README.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vm2api-usage
+  namespace: vm2api
+  labels:
+    app.kubernetes.io/name: vm2api-usage
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vm2api-usage
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: nginx-ingress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: nginx-ingress
+              app.kubernetes.io/instance: nginx-ingress
+              app.kubernetes.io/component: controller
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vm2api
+      ports:
+        - port: 8787
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

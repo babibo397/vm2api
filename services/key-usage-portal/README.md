@@ -119,9 +119,9 @@ manifest digest from the Singapore registry** for each image. This registry
 may expose the child manifest without the build's outer OCI index. Preflight
 both digest-pinned pulls on an allowed node before updating the live gateway.
 
-Replace `REPLACE_WITH_PUBLISHED_DIGEST` in
+For later releases, update the digest in
 `deploy/key-usage/deployment.yaml` with the verified portal digest before
-applying it. This placeholder is deliberately not a deployable image. Set the
+applying it. The committed digest records the verified 2026-11-11 release. Set the
 gateway image to its own verified digest; never reuse the portal digest. Keep
 the final digest references in the release record and tracked manifests.
 
@@ -249,3 +249,24 @@ The compatible gateway extension may remain installed. If it also needs
 rollback, restore its recorded image/revision independently, preserving the
 PVC and existing configuration. Lowering retention is a separate data-deleting
 operation, not an automatic rollback step.
+
+## Current gateway capacity
+
+The 2026-11-11 rollout found 14 existing account slots and repeated gateway
+`OOMKilled` restarts at the old 2Gi limit. The gateway now requests 500m CPU /
+2Gi memory and limits 2 CPU / 3Gi memory. These are gateway resources; the
+portal retains 100m/128Mi requests and 500m/256Mi limits. The gateway patch
+preserves its existing node selector, required hostname affinity, `regcred`,
+PVC and Recreate strategy:
+
+```sh
+kubectl --context local-xjp -n vm2api patch deployment vm2api \
+  --type=strategic --patch-file deploy/key-usage-gateway-patch.json
+```
+
+The 3Gi stabilization attempt later failed: one Pod was evicted for node memory
+pressure and its replacement was OOMKilled at the 3Gi container limit. The user
+selected keeping the current deployment and delivering the portal with this
+capacity limitation. Do not describe gateway stability as verified or change
+capacity/scheduling automatically. Full evidence and image-only rollback are
+in `deploy/KEY_USAGE_RELEASE_20261111.md`.

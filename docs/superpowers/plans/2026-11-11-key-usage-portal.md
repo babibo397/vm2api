@@ -1,6 +1,6 @@
 # Key Usage Portal Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Ship a standalone Chinese self-service page where a vm2api managed Key holder can inspect their own usage over a chosen time range.
 
@@ -59,11 +59,11 @@ Summary fields reused identically. `cost` is known current log actual_cost, not 
 
 **Interfaces:** Produces new range route automatically through KEY_SELF_PATHS, existing createKeySelfHandler injection remains compatible. `readKeyUsageRange({dbPath,apiKeyId,range,limit,cursor,...})` returns Shared Wire Contract, with controlled errors. May expose injection seams for unit tests. Resolve singleton file via getDbPath; do not mutate existing shared SQLite worker pool.
 
-- [ ] Add RED tests asserting per-Key isolation and identical bounds for summary/series/models/recent, offset validation, midnight/end exclusion, future clamp, invalid spans/cursors, unknown/unpriced and pruned history, >50-model remainder and pending/error outcomes.
-- [ ] Add RED real-worker tests for query_only writes forbidden, active<=4, kill on deadline, capacity held until exit and no main-thread fallback; auth regression checks disabled legacy owner, expired/exhausted allowed and no inference quota writes.
-- [ ] Implement bounded disposable workers (read-only DB, short read transaction, terminated in finally) and safe range query. Use worker concurrency global to gateway module; no need for permanent extra pool lifecycle hooks. Uniform errors 400 validation, 401 unavailable key, 429 self rate, 503 capacity/start failure, 504 execution deadline.
-- [ ] Extend self route and set no-store. Remove internal model fallback for new public range; do not expose owner info. Preserve old usage response contract. Apply _ownerActive consistently to legacy authentication before migration.
-- [ ] Run focused Node 22 tests, key-self suite, syntax/Biome; record actual RED/GREEN evidence. Leave source uncommitted for coordinator to integrate.
+- [x] Add RED tests asserting per-Key isolation and identical bounds for summary/series/models/recent, offset validation, midnight/end exclusion, future clamp, invalid spans/cursors, unknown/unpriced and pruned history, >50-model remainder and pending/error outcomes.
+- [x] Add RED real-worker tests for query_only writes forbidden, active<=4, kill on deadline, capacity held until exit and no main-thread fallback; auth regression checks disabled legacy owner, expired/exhausted allowed and no inference quota writes.
+- [x] Implement bounded disposable workers (read-only DB, short read transaction, terminated in finally) and safe range query. Use worker concurrency global to gateway module; no need for permanent extra pool lifecycle hooks. Uniform errors 400 validation, 401 unavailable key, 429 self rate, 503 capacity/start failure, 504 execution deadline.
+- [x] Extend self route and set no-store. Remove internal model fallback for new public range; do not expose owner info. Preserve old usage response contract. Apply _ownerActive consistently to legacy authentication before migration.
+- [x] Run focused Node 22 tests, key-self suite, syntax/Biome; record actual RED/GREEN evidence. Leave source uncommitted for coordinator to integrate.
 
 ### Task 2: Standalone middleware and packaging (coordinator)
 
@@ -71,10 +71,10 @@ Summary fields reused identically. `cost` is known current log actual_cost, not 
 
 **Interfaces:** `createPortalServer({upstream,staticDir,fetchImpl,limits,...})` returns node:http Server; production PORT 8080 and fixed config VM2API_UPSTREAM. Serves web/dist, healthz, api usage/quota only. Consumes shared contract; no broad reverse proxy.
 
-- [ ] Write RED tests with local fake upstream: Bearer only/headers stripped; whitelist route/query; no cross-origin redirect; safe bounded JSON response; no-store; quota nested projection excludes user_concurrency; structured safe errors; slow body deadline; key/IP throttling and bounded state; safe static path/SPA serving and CSP.
-- [ ] Implement native HTTP/fetch service. Trust forwarding IP only from configured ingress hops/CIDRs; otherwise socket peer. Hash presented Key for local limiting; do not log arbitrary errors or requests. Return safe 502/504 without raw upstream bodies. No user-specified upstream.
-- [ ] Run middleware tests; build independent Node 22 multi-stage image with web build, nonroot process and no persistent volume. Backend package remains dependency-free.
-- [ ] Document env variables, local run/tests, build/deploy and privacy/retention behavior.
+- [x] Write RED tests with local fake upstream: Bearer only/headers stripped; whitelist route/query; no cross-origin redirect; safe bounded JSON response; no-store; quota nested projection excludes user_concurrency; structured safe errors; slow body deadline; key/IP throttling and bounded state; safe static path/SPA serving and CSP.
+- [x] Implement native HTTP/fetch service. Trust forwarding IP only from configured ingress hops/CIDRs; otherwise socket peer. Hash presented Key for local limiting; do not log arbitrary errors or requests. Return safe 502/504 without raw upstream bodies. No user-specified upstream.
+- [x] Run middleware tests; build independent Node 22 multi-stage image with web build, nonroot process and no persistent volume. Backend package remains dependency-free.
+- [x] Document env variables, local run/tests, build/deploy and privacy/retention behavior.
 
 ### Task 3: Chinese responsive self-service webpage
 
@@ -82,22 +82,22 @@ Summary fields reused identically. `cost` is known current log actual_cost, not 
 
 **Interfaces:** GET same-origin `/api/usage` and `/api/quota` with in-memory Bearer; Shared Wire Contract. `npm run build` produces web/dist; `npm test` verifies meaningful state/time helpers. Vite development proxy to localhost:8080; no seeded production data.
 
-- [ ] Establish a complete restrained code-native design: clear Key entry, time selection, summary band, trend, model table and request table; useful empty/error/loading states. No decorative raster media needed. Image concept tool currently unavailable; record this concrete blocker and use documented tokens/layout as reference.
-- [ ] Write RED date/state tests for Shanghai inclusive end-day, presets, offset submission, hour/day change, pending-request cancellation, Key change clearing all data, pagination range preservation and null costs.
-- [ ] Implement React/Vite modular UI, default Shanghai timezone, today/yesterday/7d/30d/custom range, hour/day, same-Key quota, charts and safe tables, no key storage or third-party network scripts. No info about internal accounts/proxies or server architecture in user flow.
-- [ ] Test/build; supply deterministic synthetic demo fixture ONLY in test/dev harness, unavailable production. Coordinator handles browser QA with mock upstream and real reads.
-- [ ] Leave files uncommitted; report build and tests, key UX decisions and any contract mismatch.
+- [x] Establish a complete restrained code-native design: clear Key entry, time selection, summary band, trend, model table and request table; useful empty/error/loading states. No decorative raster media needed. Image concept tool currently unavailable; record this concrete blocker and use documented tokens/layout as reference.
+- [x] Write RED date/state tests for Shanghai inclusive end-day, presets, offset submission, hour/day change, pending-request cancellation, Key change clearing all data, pagination range preservation and null costs.
+- [x] Implement React/Vite modular UI, default Shanghai timezone, today/yesterday/7d/30d/custom range, hour/day, same-Key quota, charts and safe tables, no key storage or third-party network scripts. No info about internal accounts/proxies or server architecture in user flow.
+- [x] Test/build; supply deterministic synthetic demo fixture ONLY in test/dev harness, unavailable production. Coordinator handles browser QA with mock upstream and real reads.
+- [x] Leave files uncommitted; report build and tests, key UX decisions and any contract mismatch.
 
 ### Task 4: Integration review, browser QA and deployment
 
 **Files:** Update `deploy/Dockerfile.proxy-health`; create tracked `deploy/key-usage/{deployment,service,ingress,networkpolicy}.yaml`, release docs. Only image refs in primary existing untracked k8s files may be updated after deployment.
 
-- [ ] Review Tasks 1–3 independently and resolve findings. Run packaged gateway regressions plus both-Key end-to-end requests against isolated DB. Exercise middleware+page desktop/mobile in Browser/IAB; use Playwright fallback only if needed with reason.
-- [ ] Verify timeout/resource behavior and raw SQL reconciliation. Inspect source/diff for credentials or data persistence. Render screenshot and fix layout/interaction problems.
-- [ ] Back up live Deployment and online SQLite state plus current retention config. Inspect existing DNS/TLS/Ingress and plugin NetworkPolicy support. Reuse wildcard certificate only if valid for selected hostname; no need to disclose private certificate material.
-- [ ] Commit reviewed source, ff local main preserving unrelated edits, push fork. Build/test/push immutable gateway overlay and portal images; preflight pull from Singapore registry with regcred and constrained nodes.
-- [ ] Deploy compatible gateway first; restore/warm existing running kernels via supported start API if necessary, compare slot identities and health. Apply only approved summary retention_days=90, keep debug settings. Then deploy portal/Ingress/policy with node constraints.
-- [ ] Verify public portal TLS, page/API health, invalid key isolation, controlled real self query with secrets suppressed, all existing slots healthy, normal new-api internal health, no inference counts increased due verification. Save rollback and report final URL/limits.
+- [x] Review Tasks 1–3 independently and resolve findings. Run packaged gateway regressions plus both-Key end-to-end requests against isolated DB. Exercise middleware+page desktop/mobile in Browser/IAB; use Playwright fallback only if needed with reason.
+- [x] Verify timeout/resource behavior and raw SQL reconciliation. Inspect source/diff for credentials or data persistence. Render screenshot and fix layout/interaction problems.
+- [x] Back up live Deployment and online SQLite state plus current retention config. Inspect existing DNS/TLS/Ingress and plugin NetworkPolicy support. Reuse wildcard certificate only if valid for selected hostname; no need to disclose private certificate material.
+- [x] Commit reviewed source, ff local main preserving unrelated edits, push fork. Build/test/push immutable gateway overlay and portal images; preflight pull from Singapore registry with regcred and constrained nodes.
+- [x] Deploy compatible gateway first; restore/warm existing running kernels via supported start API if necessary, compare slot identities and health. Apply only approved summary retention_days=90, keep debug settings. Then deploy portal/Ingress/policy with node constraints.
+- [x] Verify public portal TLS, page/API health, invalid key isolation, controlled real self query with secrets suppressed, all existing slots healthy, normal new-api internal health, no inference counts increased due verification. Save rollback and report final URL/limits.
 
 ## Rulings
 
@@ -110,3 +110,7 @@ Summary fields reused identically. `cost` is known current log actual_cost, not 
 
 - Public page: `https://vm2api.fireflyops.cn/usage/`, selected by user on 2026-11-11; no DNS change.
 - Query isolation uses disposable child processes, SIGKILL on completion/deadline, and waits for actual exit before releasing capacity. Native SQLite blocked `Worker.terminate()` for 4705ms in a reproduction, so worker threads cannot guarantee the deadline. Cap 4, query deadline 8s; portal deadline 10s.
+
+## Delivery exception approved by user
+
+On 2026-11-11 the user selected “保持现状，先交付查询页和容量问题说明”. Portal feature, images, constrained deployment, public HTTPS and SQL reconciliation are complete. Gateway stability is **not** verified: the 3Gi Pod was evicted at10:38:22Z and its replacement OOMKilled at10:57:53Z. Preserve current resources and node constraints; no capacity upgrade or scheduling expansion is part of this handoff. See `deploy/KEY_USAGE_RELEASE_20261111.md`.

@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vm2api-usage
+  namespace: vm2api
+  labels:
+    app.kubernetes.io/name: vm2api-usage
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1k"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "3"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "off"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - vm2api.fireflyops.cn
+      secretName: fireflyops.cn
+  rules:
+    - host: vm2api.fireflyops.cn
+      http:
+        paths:
+          # Preserve /usage: build uses /usage/, runtime BASE_PATH uses /usage.
+          # The existing vm2api Ingress continues to handle the / prefix.
+          - path: /usage
+            pathType: Prefix
+            backend:
+              service:
+                name: vm2api-usage
+                port:
+                  number: 8080
