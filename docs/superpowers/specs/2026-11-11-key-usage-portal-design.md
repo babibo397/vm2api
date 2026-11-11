@@ -1,13 +1,13 @@
 # vm2api Key 用量查询中间件与网页设计
 
-状态：方案草案，等待用户评审；尚未实现或部署。
+状态：用户于 2026-11-11 回复“开始”，批准按本设计及建议默认值进入实施。
 
 ## 已确认的需求
 
 - 查询对象是 **vm2api 创建的 Key**，不包含 new-api 下游 Key。
 - 用户持有自己的 Key，可以查询指定时间范围内的使用量。
 - 用户已选择 **独立中间件＋网页**。
-- 本轮交付设计方案。下面标为“建议”的范围、容量和保留期是设计默认值，尚不是用户确认的运营规则。
+- 下文标为“建议”的范围、容量和保留期作为本次实施默认值；域名可用性和资源配置在发布验证时核对。
 
 ## 现有能力与实现选择
 
@@ -111,7 +111,7 @@ Authorization: Bearer <用户自己的 Key>
 - 首版单副本，无业务数据库、无 Redis、无 PVC；建议 requests 为 100m CPU / 128Mi 内存，limits 为 500m / 256Mi，最终以构建后压测和内存观察调整。
 - 继续限制在 `nodetype=new-api` 且 hostname 属于 `172.20.127.131`、`172.20.127.141` 的节点，镜像拉取使用 `regcred`。
 - 推送 `hx-repo.tencentcloudcr.com/devops/vm2api-usage`，集群从 `hx-repo-xjp.tencentcloudcr.com/devops/vm2api-usage` 拉取，发布采用固定 digest。
-- 建议入口 `https://usage.fireflyops.cn`，域名和证书沿用现有集群设施，实施时核对实际可用配置；入口未就绪前可以通过端口转发验收。
+- 用户确认入口 `https://vm2api.fireflyops.cn/usage/`，沿用现有域名与 TLS，无需修改 DNS。
 - 中间件只允许访问内网 vm2api 与所需 DNS；通过实际网络插件支持的 NetworkPolicy 限制。HTTPS 在 Ingress 终止。
 - 请求超时、返回大小、区间跨度与查询并发均有上限，避免大范围统计影响主服务。首版建议 worker 执行截止 8 秒、中间件上游超时 10 秒、同时执行的查询最多 4 个；并发名额只在执行任务确实结束后释放，超限不无限排队，返回可重试错误。网关需要开启/具备独立只读 worker 后才启用新区间接口。
 - 发布顺序：先发布向后兼容的 vm2api 查询扩展，再发布中间件。中间件故障只影响查询页面；其回滚不要求回滚主服务。对主服务扩展保留独立镜像回滚记录。
@@ -122,7 +122,7 @@ Authorization: Bearer <用户自己的 Key>
 
 测试优先使用隔离数据库和合成 Key/日志。线上只做经授权的自身只读查询及健康检查，不产生模型请求。页面需做桌面/手机实际交互验证。
 
-后续实施分为：自助区间 API 与权限修补、中间件与页面、隔离验证、镜像与集群发布。当前文档不授权提前实现或部署。
+实施分为：自助区间 API 与权限修补、中间件与页面、隔离验证、镜像与集群发布。用户“开始”授权执行这些步骤。
 
 ## 可由实施者决定的细节与待评审默认值
 
@@ -141,3 +141,8 @@ Authorization: Bearer <用户自己的 Key>
 ## 设计审查记录
 
 独立实施审查指出两个需要明确的边界，已由设计者决定并写入：新区间扫描绝不回退到推理主线程；费用采用当前日志统计口径，披露历史补价/修正，第一版不建立历史扣费账本。以上决定无需新增数据库或修改用户已选择的独立中间件架构。
+
+## Verified execution and entrypoint
+
+- Public page: `https://vm2api.fireflyops.cn/usage/`, selected by user on 2026-11-11; no DNS change.
+- Query isolation uses disposable child processes, SIGKILL on completion/deadline, and waits for actual exit before releasing capacity. Native SQLite blocked `Worker.terminate()` for 4705ms in a reproduction, so worker threads cannot guarantee the deadline. Cap 4, query deadline 8s; portal deadline 10s.

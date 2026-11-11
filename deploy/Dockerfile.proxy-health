@@ -10,6 +10,11 @@ COPY src/lib/oauth/codex-quota-monitor.mjs src/lib/oauth/openai-quota.mjs /opt/v
 COPY src/lib/protocol/codex-models.mjs /opt/vm2api/src/lib/protocol/codex-models.mjs
 COPY src/lib/transport/codex-kernel-supervisor.mjs /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs
 COPY src/lib/admin/panel-routes.mjs /opt/vm2api/src/lib/admin/panel-routes.mjs
+COPY src/lib/protocol/key-usage-range.mjs /opt/vm2api/src/lib/protocol/key-usage-range.mjs
+COPY src/lib/protocol/key-self.mjs /opt/vm2api/src/lib/protocol/key-self.mjs
+COPY src/lib/admin/api-keys.mjs /opt/vm2api/src/lib/admin/api-keys.mjs
+COPY src/lib/db/key-usage-reader.mjs src/lib/db/key-usage-worker.mjs /opt/vm2api/src/lib/db/
+COPY src/lib/db/repos/key-usage-range-repo.mjs /opt/vm2api/src/lib/db/repos/key-usage-range-repo.mjs
 COPY src/lib/vm/proxy-pool.mjs src/lib/vm/slot-runtime.mjs /opt/vm2api/src/lib/vm/
 COPY src/lib/cluster/slot-image.mjs src/lib/cluster/remote-slot-files.mjs src/lib/cluster/remote-slot.mjs /opt/vm2api/src/lib/cluster/
 RUN node --check /opt/vm2api/src/server.mjs \
@@ -18,6 +23,12 @@ RUN node --check /opt/vm2api/src/server.mjs \
   && node --check /opt/vm2api/src/lib/protocol/codex-models.mjs \
   && node --check /opt/vm2api/src/lib/transport/codex-kernel-supervisor.mjs \
   && node --check /opt/vm2api/src/lib/admin/panel-routes.mjs \
+  && node --check /opt/vm2api/src/lib/protocol/key-usage-range.mjs \
+  && node --check /opt/vm2api/src/lib/protocol/key-self.mjs \
+  && node --check /opt/vm2api/src/lib/admin/api-keys.mjs \
+  && node --check /opt/vm2api/src/lib/db/key-usage-reader.mjs \
+  && node --check /opt/vm2api/src/lib/db/key-usage-worker.mjs \
+  && node --check /opt/vm2api/src/lib/db/repos/key-usage-range-repo.mjs \
   && node --check /opt/vm2api/src/lib/vm/slot-runtime.mjs \
   && node --check /opt/vm2api/src/lib/vm/proxy-pool.mjs \
   && node --check /opt/vm2api/src/lib/cluster/slot-image.mjs \

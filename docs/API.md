@@ -37,6 +37,7 @@ x-api-key: sk-vm-…
 | `GET` | `/v1/usage` | — | 当前账户 5H/7D，Claude 与 GPT 均可（`unit=percent_used`） |
 | `GET` | `/v1/me/quota` | — | 本 Key 的额度、窗口、RPM、并发，以及现在会不会被拦（只限托管 Key） |
 | `GET` | `/v1/me/usage` | — | 本 Key 今天 / 近 7 天 / 近 30 天用量（按模型）和最近请求（只限托管 Key） |
+| `GET` | `/v1/me/usage/range` | — | 本 Key 指定区间的统计、趋势、模型分布和分页明细（Bearer 托管 Key） |
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
@@ -313,6 +314,50 @@ curl -sS "http://127.0.0.1:8787/v1/me/usage?limit=20&tz=Asia/Shanghai" -H "Autho
 - `cost` 是实际费用（官方价 × 分组倍率），和 `usd.used` 同一口径；未定价的请求 `cost` 为 `null`，合计按 0 计。
 - `model` 是客户端请求里写的模型名，不显示网关映射后的上游模型。`models` 按费用、请求数降序，最多 50 个。
 - 游标格式不保证稳定，原样回传即可；非法 `before` → `400 invalid_cursor`。
+
+### `GET /v1/me/usage/range`
+
+```bash
+curl -sS --get http://127.0.0.1:8787/v1/me/usage/range \
+  -H "Authorization: Bearer $KEY" \
+  --data-urlencode 'start=2026-11-01T00:00:00+08:00' \
+  --data-urlencode 'end=2026-11-11T00:00:00+08:00' \
+  --data-urlencode 'tz=Asia/Shanghai' --data-urlencode 'bucket=day'
+```
+
+只接受 `Authorization: Bearer` 托管 Key；主密钥、面板会话、`x-api-key` 均不可用于此新区间接口。身份来自该 Key，不能传入 `key_id`。到期或额度耗尽仍可查询；停用、删除或属主停用返回 401。所有自助接口（含错误）返回 `Cache-Control: no-store`；查询不调用模型、不扣额度、不计推理 RPM 或并发。
+
+| 参数 | 说明 |
+|------|------|
+| `start` / `end` | 必填，真实有效的 ISO 日期时间，必须有 `Z` 或显式时区偏移；精确到分钟、秒或毫秒。采用 `[start,end)`，结束边界不计入 |
+| `tz` | IANA 时区名，默认 `Asia/Shanghai`；非法时区返回 400 |
+| `bucket` | `day`（默认）或 `hour`；单次最多 90 天，小时最多 7 天 |
+| `limit` | 明细每页条数，默认 20；只接受 1–100 的整数 |
+| `cursor` | 上页 `recent.next_cursor`；与 Key、起止时间、时区、bucket 绑定。翻页必须使用首个响应规范化后的 `range.start` / `range.end`；进程重启后应重新查询第一页 |
+
+未来的 `end` 截止到服务端查询时间；`start` 必须早于实际截止时间。请求的原始区间也不得超过 90 天。未知参数、重复参数、无时区时间、非法日历日期、超限区间和非法游标均返回 400。选择包含结束日的日历范围时，客户端将 `end` 转为下一日当地零点。
+
+响应结构如下（示例为空结果）：
+
+```json
+{
+  "object": "api_key_usage_range",
+  "range": { "start": "2026-11-01T00:00:00.000Z", "end": "2026-11-02T00:00:00.000Z", "timezone": "Asia/Shanghai", "bucket": "day" },
+  "as_of": "2026-11-11T12:00:00.000Z",
+  "coverage": { "status": "unknown", "available_from": null, "missing_before": null, "reason": "retained_logs_only" },
+  "summary": { "requests": 0, "success": 0, "errors": 0, "other": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "total_tokens": 0, "cost": 0, "unpriced_requests": 0 },
+  "series": [],
+  "models": { "items": [], "truncated": false, "other": null },
+  "recent": { "items": [], "has_more": false, "next_cursor": null }
+}
+```
+
+- `summary`、`series`、`models` 和 `recent` 来自同一只读事务、同一 Key、同一半开区间。`series` 每项为 `bucket` 加同一套统计字段；只返回有日志的桶。日标签为 `YYYY-MM-DD`，小时标签包含当地偏移（如 `2026-11-01T01:00:00-04:00`），夏令时重复小时分别统计。
+- `models.items` 每项为 `model` 加同一套统计字段，按已知费用、请求数排序，最多 50 个。更多模型以 `truncated:true` 和 `other` 中的完整剩余统计披露。模型只使用原始客户端 `requested_model`，缺失为 `null`，不回退到可能经过映射的名称。
+- `recent.items` 包含 `request_id,created_at,model,status,outcome,error_code,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost,duration_ms`，按时间及内部稳定次序倒序。`outcome` 为 `success` / `error` / `other`；进行中、取消和未知结果单列 `other`，不算完成成功。
+- Token 使用已规范化的非缓存输入；`total_tokens` 为输入、输出、缓存读、缓存写的和，不重复计算缓存输入。`cost` 只合计当前日志的 `actual_cost`（USD），不是不可变历史账单；历史补价或修正可改变结果。明细未知费用为 `null`，统计另计 `unpriced_requests`，不能把未知费用理解为免费。
+- `coverage.available_from` 来自数据库创建和已记录裁剪边界中的较晚值；范围早于该边界时为 `partial`，`missing_before` 指向该边界。缺少持续采集证据时始终为 `unknown`，不因有日志或空结果而宣称 `complete`。提高保留天数不能恢复已清理历史。
+- 网关每 Key 最多 20 次/分钟。区间扫描采用一次性只读子进程，进程级最多同时 4 个，无排队或主线程回退；8 秒执行截止后 `SIGKILL`，确认子进程退出才释放容量。每个查询子进程的 V8 堆限制为 128 MiB；成功结果在子进程内按 UTF-8 JSON 测量，最大 1 MiB，过大的结果安全拒绝（503），不截断模型名或请求标识。错误结构为 `{ "error": { "code": "…", "message": "…" } }`；400 参数错误、401 Key 不可用、429 限流、503 容量/启动/数据库暂不可用、504 查询截止。429 / 503 携带 `Retry-After`。
 
 ## 面板额度探测
 

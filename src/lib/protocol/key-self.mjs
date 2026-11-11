@@ -9,8 +9,11 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { createRateLimiter } from '../core/security.mjs'
 import { reportTimezone, zonedDayStartMs } from '../core/timezone.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
+import { getDbPath } from '../db/database.mjs'
+import { readKeyUsageRange } from '../db/key-usage-reader.mjs'
+import { parseUsageRangeQuery } from './key-usage-range.mjs'
 
-export const KEY_SELF_PATHS = new Set(['/v1/me/quota', '/v1/me/usage'])
+export const KEY_SELF_PATHS = new Set(['/v1/me/quota', '/v1/me/usage', '/v1/me/usage/range'])
 
 const QUERYABLE = new Set(['active', 'quota_exhausted'])
 const SELF_RATE = { capacity: 60, refillPerSec: 1 }
@@ -56,7 +59,57 @@ function publicRecentRow(row) {
   }
 }
 
-export function createKeySelfHandler({ json, requireAuth, apiKeyStore, getUsageLogs, rate = SELF_RATE } = {}) {
+export function createKeySelfHandler({
+  json,
+  requireAuth,
+  apiKeyStore,
+  getUsageLogs,
+  rate = SELF_RATE,
+  getUsageDbPath = getDbPath,
+  readUsageRange = readKeyUsageRange,
+} = {}) {
+  const rangeBuckets = new Map()
+  function allowRange(id, now) {
+    let bucket = rangeBuckets.get(id)
+    if (!bucket || now - bucket.since >= 60_000) {
+      if (rangeBuckets.size >= 10000) {
+        for (const [key, entry] of rangeBuckets) if (now - entry.since >= 60_000) rangeBuckets.delete(key)
+        if (rangeBuckets.size >= 10000 && !rangeBuckets.has(id)) return false
+      }
+      bucket = { since: now, count: 0 }
+      rangeBuckets.set(id, bucket)
+    }
+    return ++bucket.count <= 20
+  }
+
+  async function rangeQuery(req, res, url, now) {
+    const token = /^Bearer ([A-Za-z0-9_-]+)$/i.exec(String(req.headers.authorization || ''))?.[1]
+    const auth = token ? apiKeyStore.authenticate(token) : null
+    const rec = auth?.ok ? auth.record : null
+    if (!rec || !QUERYABLE.has(rec.status))
+      return json(res, 401, { error: { code: 'invalid_api_key', message: 'Managed key is unavailable' } })
+    if (!allowRange(rec.id, now)) {
+      res.setHeader?.('retry-after', '60')
+      return json(res, 429, {
+        error: { code: 'gateway_rate_limit', message: 'Self-service query limit exceeded; retry later' },
+      })
+    }
+    try {
+      const options = parseUsageRangeQuery(url.searchParams, now)
+      const result = await readUsageRange({ dbPath: getUsageDbPath(), apiKeyId: rec.id, ...options, now })
+      return json(res, 200, result)
+    } catch (error) {
+      const status = [400, 503, 504].includes(error?.status) ? error.status : 503
+      if (status === 503) res.setHeader?.('retry-after', '1')
+      return json(res, status, {
+        error: {
+          code: status === 400 ? 'invalid_range' : status === 504 ? 'usage_timeout' : 'usage_unavailable',
+          message:
+            status === 400 ? 'Invalid usage range or cursor' : 'Usage query is temporarily unavailable; retry later',
+        },
+      })
+    }
+  }
   const allow = createRateLimiter(rate)
   const retryAfter = String(Math.max(1, Math.ceil(1 / (Number(rate.refillPerSec) || 1))))
 
@@ -121,6 +174,8 @@ export function createKeySelfHandler({ json, requireAuth, apiKeyStore, getUsageL
   }
 
   return async function handleKeySelf(req, res, url, now = Date.now()) {
+    res.setHeader?.('cache-control', 'no-store')
+    if (url.pathname === '/v1/me/usage/range') return rangeQuery(req, res, url, now)
     const rec = authorize(req, res)
     if (!rec) return
     if (url.pathname === '/v1/me/quota') {

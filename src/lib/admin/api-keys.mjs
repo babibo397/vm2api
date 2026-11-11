@@ -220,6 +220,7 @@ export class ApiKeyStore {
     for (const rec of this.repo.list()) {
       if (String(rec.key || '').startsWith(HASH_MARKER)) continue
       if (timingSafeEqualStr(token, rec.key)) {
+        if (!this._ownerActive(rec)) return { ok: false, reason: 'user_disabled' }
         rec.key_hash = hash
         rec.key_prefix = String(token).slice(0, 10)
         rec.key_suffix = String(token).slice(-4)
