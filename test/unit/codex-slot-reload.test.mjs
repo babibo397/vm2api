@@ -387,6 +387,117 @@ test('Claude destruction retains the ordinary container-only result', async (t) 
   assert.equal(gone.action, 'absent')
 })
 
+test('slot destruction forwards subscription confirmation requirements to the host', async (t) => {
+  await fixture(t)
+  for (const requireConfirmation of [true, false]) {
+    let received
+    const gone = await destroySlot({ id: 'vm-claude', platform: 'anthropic' }, null, {
+      requireConfirmation,
+      ops: {
+        destroySlot: async (_vm, options) => {
+          received = options
+          return { ok: true, teardownConfirmed: requireConfirmation }
+        },
+      },
+    })
+    assert.equal(gone.ok, true)
+    assert.deepEqual(received, { requireConfirmation })
+  }
+})
+
+test('panel deletion keeps Codex cleanup inside its teardown guard without releasing a Claude subscription', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-delete-held')
+  let blocked
+  const response = {}
+  const handle = createPanelHandler({
+    cfg: { paths: { project: f.root } },
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, body) {
+      response.status = status
+      response.body = body
+      return true
+    },
+    cragSubscription: {
+      teardown() {
+        throw new Error('Codex must not release a Claude subscription')
+      },
+    },
+    proxyPool: {
+      unbindVm() {
+        blocked = ensureCodexKernel(first.exec)
+      },
+    },
+  })
+  await handle({ method: 'DELETE' }, {}, new URL(`http://localhost/api/panel/vms/${first.vm.id}`))
+  assert.equal(response.status, 200)
+  assert.deepEqual(await blocked, { ok: false, reason: 'teardown_in_progress' })
+  assert.equal(codexKernelTracked(first.vm.id), false)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', `${first.vm.id}.json`)), false)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', first.vm.id)), false)
+})
+
+for (const failRelease of [false, true]) {
+  test(`panel Claude deletion ${failRelease ? 'preserves files after failed' : 'cleans files only after'} subscription release`, async (t) => {
+    const f = await fixture(t)
+    const vm = { id: 'vm-subscribed', platform: 'anthropic', runtime: { type: 'docker' } }
+    const vmPath = path.join(f.root, 'vms', `${vm.id}.json`)
+    const home = path.join(f.root, 'vms', vm.id)
+    fs.mkdirSync(home, { recursive: true })
+    fs.writeFileSync(vmPath, JSON.stringify(vm))
+    const marker = path.join(home, 'permit')
+    fs.writeFileSync(marker, 'fixture-data')
+    fs.writeFileSync(path.join(f.root, 'bin', 'docker'), '#!/bin/sh\necho "Error: No such container: $5" >&2\nexit 1\n')
+    let releaseAttempted = false
+    let released = false
+    let unbound = false
+    const response = {}
+    const handle = createPanelHandler({
+      cfg: { paths: { project: f.root } },
+      requireAuth(req) {
+        req.apiKeyKind = 'master'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        response.status = status
+        response.body = body
+        return true
+      },
+      cragSubscription: {
+        async teardown(slot, destroy) {
+          assert.equal(slot.id, vm.id)
+          const result = await destroy(true)
+          assert.equal(result.teardownConfirmed, true)
+          assert.equal(fs.readFileSync(marker, 'utf8'), 'fixture-data')
+          assert.equal(fs.existsSync(vmPath), true)
+          releaseAttempted = true
+          if (failRelease) throw new Error('subscription release failed')
+          released = true
+          return { ...result, reclaim_pending: true }
+        },
+      },
+      proxyPool: {
+        unbindVm() {
+          assert.equal(released, true)
+          unbound = true
+        },
+      },
+    })
+    await handle({ method: 'DELETE' }, {}, new URL(`http://localhost/api/panel/vms/${vm.id}`))
+    assert.equal(response.status, failRelease ? 409 : 200)
+    assert.equal(releaseAttempted, true)
+    assert.equal(unbound, !failRelease)
+    assert.equal(fs.existsSync(vmPath), failRelease)
+    assert.equal(fs.existsSync(marker), failRelease)
+    if (!failRelease) assert.equal(response.body.data.reclaim_pending, true)
+  })
+}
+
 for (const action of ['reset', 'delete']) {
   test(`panel ${action} preserves the record and home when a Codex listener cannot be stopped`, async (t) => {
     const f = await fixture(t)

@@ -11,6 +11,7 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  restoreKernelErrorStatus,
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
@@ -20,6 +21,10 @@ import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
+import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
+import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
   const restored = restoreUncommittedHop({
@@ -104,6 +109,47 @@ test('semanticStatusForStreamError reads outer Codex status 500 instead of defau
     502,
   )
 })
+test('server overload errors map to 503 and preserve retry identity', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.',
+    },
+  }
+  assert.equal(semanticStatusForStreamError(body), 503)
+  const restored = restoreUncommittedHop({
+    ok: false,
+    status: 200,
+    committed: false,
+    terminalState: 'incomplete',
+    headers: {},
+    body,
+  })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  assert.equal(restored.streamError, true)
+})
+test('kernel-wrapped server overload restores 503 but explicit status wins', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'overloaded',
+    },
+  }
+  const restored = restoreKernelErrorStatus({ ok: false, status: 502, body })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  const explicit = restoreKernelErrorStatus({
+    ok: false,
+    status: 502,
+    body: { ...body, error: { ...body.error, status: 502 } },
+  })
+  assert.equal(explicit.status, 502)
+})
 
 test('restoreUncommittedHop reports Codex outer status 500 rather than 502', () => {
   const restored = restoreUncommittedHop({
@@ -160,7 +206,7 @@ test('worker canonicalizes passthrough bodies before either kernel', () => {
       exec: {
         homeDir: '',
         vm: { claude: { mode: 'setup-token', scope: 'user:inference' } },
-        workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+        workerStatus: { runtime_variant: 'crag-v2', capabilities: ['prompt_append'] },
       },
       identity: null,
       cliHop: true,
@@ -354,7 +400,8 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
     cragPrint: false,
   })
   assert.equal(forced.body.crag_model, undefined)
-  const live = finalizeWorkerPayload({
+  // A live native worker can override stale VM metadata, but model support is not prompt support.
+  const modelOnly = finalizeWorkerPayload({
     body,
     reqHeaders: {},
     exec: {
@@ -364,8 +411,8 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
     },
     identity: null,
   })
-  assert.equal(live.body.crag_model.id, 'claude-haiku-4-5-20251001')
-  assert.equal(live.body.crag_prompt.mode, 'append')
+  assert.equal(modelOnly.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(Object.hasOwn(modelOnly.body, 'crag_prompt'), false)
 })
 
 const unix = process.platform !== 'win32'
@@ -453,6 +500,146 @@ unixTest('callGoWorker sends envelope over authenticated Unix socket', async () 
     assert.equal(result.body.content[0].text, 'ok')
   } finally {
     await fx.close()
+  }
+})
+
+unixTest('callGoWorker puts caller cwd only in an authorized native Unix socket envelope', async () => {
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    posted.push({
+      method: req.method,
+      url: req.url,
+      token: req.headers['x-kin-internal-token'],
+      envelope: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+    })
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+  })
+  const callerCwd = '/synthetic/work space/项目'
+  const body = {
+    model: 'claude-haiku-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    crag_prompt: { mode: 'append', text: 'caller guidance' },
+    caller_cwd: '/synthetic/forged-body-value',
+  }
+  try {
+    for (const [name, variant, capabilities, cwd, cragPrint, expectCwd, expectPrompt] of [
+      ['authorized', 'crag-v2', ['caller_cwd', 'prompt_append'], callerCwd, null, true, true],
+      ['cwd only', 'crag-v2', ['caller_cwd'], callerCwd, null, true, false],
+      ['append only', 'crag-v2', ['prompt_append'], callerCwd, null, false, true],
+      ['not native', 'cli-node', ['caller_cwd', 'prompt_append'], callerCwd, null, false, false],
+      ['print disabled', 'crag-v2', ['caller_cwd', 'prompt_append'], callerCwd, false, false, false],
+      ['no trusted cwd', 'crag-v2', ['caller_cwd', 'prompt_append'], null, null, false, true],
+    ]) {
+      const result = await callGoWorker({
+        exec: { ...fx.exec, workerStatus: { runtime_variant: variant, capabilities } },
+        body,
+        callerCwd: cwd,
+        cragPrint,
+        timeoutMs: 3000,
+      })
+      assert.equal(result.ok, true, name)
+      assert.equal(posted.length, 1, name)
+      const { method, url, token, envelope } = posted.pop()
+      assert.deepEqual({ method, url, token }, { method: 'POST', url: '/internal/v1/messages', token: 'internal-test' })
+      assert.equal(Object.hasOwn(envelope, 'caller_cwd'), expectCwd, name)
+      if (expectCwd) assert.equal(envelope.caller_cwd, callerCwd, name)
+      assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false, name)
+      assert.equal(JSON.stringify(envelope.body).includes(callerCwd), false, name)
+      assert.equal(JSON.stringify(envelope).includes(body.caller_cwd), false, name)
+      assert.deepEqual(envelope.body.crag_prompt, expectPrompt ? body.crag_prompt : undefined, name)
+      assert.equal(Object.hasOwn(envelope.body, 'crag_model'), false, name)
+    }
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('redaction masks caller cwd and omits it when the masked value is no longer absolute', async (t) => {
+  const rawCwd = '/synthetic/private-workspace'
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    posted.push(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }))
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  const exec = { ...fx.exec, workerStatus: { runtime_variant: 'crag-v2', capabilities: ['caller_cwd'] } }
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: rawCwd }] }
+  for (const replacement of ['/synthetic/{{R_PATH_fixture}}', '{{R_PATH_fixture}}']) {
+    publishRedactionForTests({
+      enabled: true,
+      ready: true,
+      policy,
+      client: {
+        async mask({ body }) {
+          return { body: body.replaceAll(rawCwd, replacement) }
+        },
+        async restore({ body }) {
+          return { body }
+        },
+      },
+    })
+    const result = await callGoWorker({
+      exec,
+      body,
+      callerCwd: rawCwd,
+      routing: { redaction: policy },
+      redactionPrincipal: 'fixture-principal',
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(posted.length, 1)
+    const envelope = posted.pop()
+    assert.equal(JSON.stringify(envelope).includes(rawCwd), false)
+    assert.ok(JSON.stringify(envelope.body.messages).includes(replacement))
+    assert.equal(envelope.caller_cwd, replacement.startsWith('/') ? replacement : undefined)
+  }
+})
+
+unixTest('prebuilt call and stream envelopes cannot carry caller cwd', async (t) => {
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    posted.push(envelope)
+    if (envelope.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-terminal-state': 'verified' })
+      writeData(res, { type: 'message_start', message: { id: 'msg_prebuilt' } })
+      writeData(res, { type: 'message_stop' })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }))
+  })
+  t.after(() => fx.close())
+  const callerCwd = '/synthetic/untrusted-prebuilt'
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  for (const [send, stream] of [
+    [callGoWorker, false],
+    [streamGoWorker, true],
+  ]) {
+    const result = await send({
+      exec: { ...fx.exec, workerStatus: { runtime_variant: 'crag-v2', capabilities: ['caller_cwd'] } },
+      envelope: { body: { ...body, caller_cwd: callerCwd }, caller_cwd: callerCwd, stream },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(posted.length, 1)
+    const sent = posted.pop()
+    assert.equal(Object.hasOwn(sent, 'caller_cwd'), false)
+    assert.equal(sent.body.caller_cwd, undefined)
+    assert.deepEqual(sent.body.messages, [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
   }
 })
 
@@ -807,7 +994,8 @@ unixTest('streamGoWorker does not stamp TTFT on metadata-only Responses complete
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.equal(result.usage.input_tokens, 12)
@@ -865,7 +1053,8 @@ unixTest('streamGoWorker stamps TTFT on a Responses function name, not response.
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.ok(result.ttftMs != null && result.ttftMs >= 0)
@@ -954,7 +1143,6 @@ unixTest('streamGoWorker stamps TTFT on text and thinking deltas', async () => {
 unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible output', async (t) => {
   let now = 1_000
   t.mock.method(Date, 'now', () => now)
-  const sawEmpty = gate()
   const sawProgress = gate()
   const fx = await fixture(async (req, res) => {
     res.setHeader('content-type', 'text/event-stream')
@@ -965,7 +1153,9 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
       index: 0,
       delta: { type: 'thinking_delta', thinking: '', estimated_tokens: 0 },
     })
-    await sawEmpty.ready
+    // Empty progress is intentionally held before commit. Advance the server
+    // clock rather than waiting for that uncommitted frame downstream.
+    now = 2_000
     writeData(res, {
       type: 'content_block_delta',
       index: 0,
@@ -989,10 +1179,7 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
         messages: [{ role: 'user', content: 'hi' }],
       },
       onEvent: (line) => {
-        if (line.includes('"estimated_tokens":0')) {
-          now = 2_000
-          sawEmpty.release()
-        } else if (line.includes('"estimated_tokens":50')) {
+        if (line.includes('"estimated_tokens":50')) {
           now = 5_000
           sawProgress.release()
         }
@@ -1332,7 +1519,8 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.equal(result.usage.input_tokens, 120)
@@ -1344,12 +1532,32 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   }
 })
 
-test('terminal metadata is not a downstream commit', () => {
+test('terminal metadata and empty blocks are not downstream commits', () => {
   assert.equal(isDownstreamCommitEvent({ type: 'message_start', message: {} }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'error', error: { message: 'Connection error' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_stop' }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: {} }), false)
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'text', text: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'thinking', thinking: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 1 } }),
+    true,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'x' } }),
+    true,
+  )
   assert.equal(
     isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } }),
     true,
@@ -1457,7 +1665,11 @@ for (const call of [callGoWorker, streamGoWorker]) {
         res.end(structured ? JSON.stringify(upstream) : 'Failed to buffer the request body: length limit exceeded')
       })
       try {
-        const result = await call({ exec: fx.exec, envelope: { body: { input: 'hi' } } })
+        const result = await call({
+          exec: fx.exec,
+          envelope: { body: { input: 'hi' } },
+          requestPath: '/internal/v1/codex/responses',
+        })
         assert.equal(result.status, 413)
         assert.equal(result.ok, false)
         assert.equal(result.transportError, false)
@@ -1486,13 +1698,23 @@ for (const call of [callGoWorker, streamGoWorker]) {
       res.end(JSON.stringify({ error: { code: 'fixture_reached' } }))
     })
     try {
-      const oversized = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes - 1 })
+      const oversized = await call({
+        exec: fx.exec,
+        envelope,
+        maxRequestBytes: bytes - 1,
+        requestPath: '/internal/v1/codex/responses',
+      })
       assert.equal(oversized.status, 413)
       assert.equal(oversized.body.error.code, 'body_too_large')
       assert.equal(oversized.body.error.details.retryable, false)
       assert.equal(oversized.transportError, false)
       assert.equal(requests, 0)
-      const exact = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes })
+      const exact = await call({
+        exec: fx.exec,
+        envelope,
+        maxRequestBytes: bytes,
+        requestPath: '/internal/v1/codex/responses',
+      })
       assert.equal(exact.status, 400)
       assert.equal(exact.body.error.code, 'fixture_reached')
       assert.equal(requests, 1)
@@ -1516,6 +1738,7 @@ for (const mode of ['first-byte', 'idle']) {
       const result = await streamGoWorker({
         exec: fx.exec,
         envelope: { body: { input: 'hi' } },
+        requestPath: '/internal/v1/codex/responses',
         timeoutMs: mode === 'first-byte' ? 20 : 4000,
         idleTimeoutMs: 20,
         signal: controller.signal,
@@ -1550,5 +1773,177 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
     assert.equal(requests, 0)
   } finally {
     await fx.close()
+  }
+})
+
+unixTest('redaction 413 stops failover before any worker dispatch for call and stream clients', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  let masks = 0
+  publishRedactionForTests({
+    enabled: true,
+    ready: true,
+    policy,
+    client: {
+      async mask({ maxBodyBytes }) {
+        masks++
+        assert.equal(maxBodyBytes, 64 * 1024 * 1024)
+        throw Object.assign(new Error('redaction body exceeds the configured request body limit'), {
+          code: 'redaction_body_too_large',
+          status: 413,
+          details: { retryable: false },
+        })
+      },
+    },
+  })
+  for (const call of [callGoWorker, streamGoWorker, callCodexKernel, streamCodexKernel]) {
+    const body =
+      call === callCodexKernel || call === streamCodexKernel
+        ? { input: 'fixture' }
+        : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          assert.equal(selections, 1, 'a local size error must not select another account')
+          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
+        },
+        markCooldown() {
+          assert.fail('a local size error must not cool down an account')
+        },
+      },
+    })
+    const result = await runner.run({
+      requestId: `redaction-size-${call.name}`,
+      model: 'fixture-model',
+      canonicalBody: body,
+      callAttempt: () =>
+        call({
+          exec: fx.exec,
+          envelope: { body },
+          routing: { redaction: policy, failover: { max_request_mib: 64 } },
+          redactionPrincipal: 'fixture-principal',
+        }),
+    })
+    assert.equal(result.status, 413, call.name)
+    assert.equal(result.body.error.code, 'redaction_body_too_large')
+    assert.equal(result.body.error.type, 'invalid_request_error')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.equal(result.transportError, false)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(selections, 1)
+  }
+  assert.equal(masks, 4)
+  assert.equal(requests, 0)
+})
+
+unixTest('invalid Messages are rejected before either kernel accepts a turn', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(() => fx.close())
+  for (const runtime_variant of ['cli-node', 'crag-v2']) {
+    const exec = { ...fx.exec, workerStatus: { runtime_variant } }
+    for (const send of [callGoWorker, streamGoWorker]) {
+      for (const prebuilt of [false, true]) {
+        for (const messages of [
+          [],
+          [{ role: 'user', content: ' \n\t' }],
+          [{ role: 'user', content: 42 }],
+          [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }],
+        ]) {
+          const body = { model: 'claude-sonnet-5', messages }
+          const result = await send({ exec, ...(prebuilt ? { envelope: { body } } : { body }) })
+          assert.equal(result.status, 400)
+          assert.equal(result.body.error.code, 'invalid_kernel_request')
+          assert.equal(result.transportError, false)
+          assert.equal(result.upstreamExecutions, 0)
+          assert.equal(result.committed, false)
+          const policy = classifyUpstreamResult(result)
+          assert.equal(policy.scope, 'request')
+          assert.equal(policy.action, 'stop')
+        }
+      }
+    }
+  }
+  assert.equal(requests, 0)
+})
+
+unixTest('kernel preparation isolates controls without rewriting tool continuation history', async (t) => {
+  const history = [
+    { role: 'user', content: [{ type: 'text', text: 'read the file' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'plan', signature: 'signed-history-12345678901234567890' },
+        { type: 'tool_use', id: 'tool_history_1', name: 'Read', input: { path: '/synthetic/file' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'tool_history_1', content: 'file content' },
+        { type: 'text', text: 'continue' },
+      ],
+    },
+  ]
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const sent = JSON.parse(Buffer.concat(chunks))
+    assert.deepEqual(sent.body.messages, history)
+    for (const key of ['request_context', 'gateway_policy', 'kin_outbound_shape', 'request_id', 'delivery_mode']) {
+      assert.equal(Object.hasOwn(sent.body, key), false)
+    }
+    assert.deepEqual(sent.body.safeguards, { synthetic_extension: true })
+    if (sent.body.crag_prompt) {
+      assert.deepEqual(sent.body.crag_options, { effort: 'high' })
+      assert.equal(sent.body.auto_compact_window, undefined)
+    } else {
+      assert.equal(sent.body.crag_model, undefined)
+      assert.equal(sent.body.crag_options, undefined)
+      assert.equal(sent.body.auto_compact_window, 200000)
+    }
+    res.writeHead(409, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'tool_result replayed' } }),
+    )
+  })
+  t.after(() => fx.close())
+  for (const runtime_variant of ['cli-node', 'crag-v2']) {
+    const exec = { ...fx.exec, workerStatus: { runtime_variant, capabilities: ['prompt_append', 'model_directive'] } }
+    for (const prebuilt of [false, true]) {
+      const body = {
+        model: 'claude-sonnet-5',
+        max_tokens: 128,
+        messages: structuredClone(history),
+        request_context: { purpose: 'untrusted' },
+        gateway_policy: {},
+        kin_outbound_shape: 'lean',
+        request_id: 'untrusted',
+        delivery_mode: 'untrusted',
+        crag_prompt: { mode: 'append', text: 'caller instruction' },
+        crag_options: { transport: 'print', effort: 'high' },
+        auto_compact_window: 200000,
+        safeguards: { synthetic_extension: true },
+      }
+      const result = await callGoWorker({ exec, cliHop: true, ...(prebuilt ? { envelope: { body } } : { body }) })
+      assert.equal(result.status, 409)
+      assert.equal(result.transportError, false)
+    }
   }
 })

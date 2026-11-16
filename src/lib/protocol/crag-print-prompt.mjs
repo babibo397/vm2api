@@ -58,7 +58,7 @@ const MODEL_DIRECTIVE_CAPS = ['model_directive', 'linux_tui_pty']
 export function cragConsumesModelDirective(health) {
   const caps = health?.capabilities
   if (!Array.isArray(caps)) return false
-  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(String(cap || '')))
+  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(cap))
 }
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
@@ -91,11 +91,83 @@ function textOf(block) {
   return ''
 }
 
-/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
-export function callerSystemTail(system) {
-  const list = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
+// Use literal LF boundaries: JavaScript's multiline anchors also match Unicode separators.
+const cwdDeclaration = /(?:^|\n)([ \t]*<cwd>[ \t]*\r?\n([^\r\n]+)\r?\n[ \t]*<\/cwd>[ \t]*)(?:\r?\n|(?![\s\S]))/
+
+function systemBlocks(system) {
+  return typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
+}
+
+export function validateCallerCwd(raw) {
+  if (typeof raw !== 'string') return null
+  const cwd = raw.replace(/^ +| +$/g, '')
+  if (!cwd.isWellFormed() || Buffer.byteLength(cwd) > 512) return null
+  if (/[<>\p{Cc}\p{Zl}\p{Zp}]/u.test(cwd) || /&(?:#[0-9]+|#x[0-9a-f]+|[a-z][a-z0-9]*);/i.test(cwd)) return null
+  if (cwd.startsWith('/')) return cwd
+  const drive = /^[a-z]:[\\/]/i.test(cwd)
+  const unc = cwd.match(/^\\\\([^\\/]+)[\\/]([^\\/]+)/)
+  if (!drive && (!unc || unc.slice(1).some((part) => ['', '.', '..'].includes(part.replace(/^ +| +$/g, '')))))
+    return null
+  return /["|?*:]/.test(drive ? cwd.slice(2) : cwd) ? null : cwd
+}
+
+/** Separate the declaration before normalization can lift history into system. */
+export function callerCwdDeclaration(system) {
+  let tags = 0
+  let declaration
+  let index
+  const blocks = systemBlocks(system)
+  for (const [i, block] of blocks.entries()) {
+    const text = textOf(block)
+    for (const _tag of text.matchAll(/<\/?cwd>/g)) if (++tags > 2) return null
+    const match = cwdDeclaration.exec(text)
+    if (match) {
+      declaration = match
+      index = i
+    }
+  }
+  const cwd = tags === 2 && validateCallerCwd(declaration?.[2])
+  if (!cwd) return null
+  const block = blocks[index]
+  const text = textOf(block)
+  const start = declaration.index + Number(declaration[0].startsWith('\n'))
+  const rest = text.slice(0, start) + text.slice(declaration.index + declaration[0].length)
+  return { cwd, index, text, rest, source: system, block }
+}
+
+// Conversion reports the normalized counterpart of the raw block before any
+// history is lifted. Intercepts can replace it; never search other blocks by value.
+export function projectCallerSystem(system, declaration) {
+  if (!declaration) return system
+  if (typeof system === 'string') {
+    return system === declaration.source && system === declaration.text ? declaration.rest : system
+  }
+  if (!Array.isArray(system)) return system
+  const index = declaration.normalizedBlock
+    ? system.indexOf(declaration.normalizedBlock)
+    : system === declaration.source && system[declaration.index] === declaration.block
+      ? declaration.index
+      : -1
+  if (index < 0 || textOf(system[index]) !== declaration.text) return system
+  const out = system.slice()
+  const block = out[index]
+  if (!declaration.rest.trim()) out.splice(index, 1)
+  else out[index] = typeof block === 'string' ? declaration.rest : { ...block, text: declaration.rest }
+  return out
+}
+
+export function trackCallerSystemBlock(system, declaration) {
+  if (!declaration || system !== declaration.source) return undefined
+  const original = systemBlocks(system)[declaration.index]
+  if (original !== declaration.block || textOf(original) !== declaration.text) return undefined
+  return (block, index) => {
+    if (index === declaration.index) declaration.normalizedBlock = block
+  }
+}
+
+function callerSystemBlocks(system) {
   const parts = []
-  for (const block of list) {
+  for (const block of systemBlocks(system)) {
     const text = textOf(block)
     if (!text) continue
     const kept = text
@@ -103,9 +175,20 @@ export function callerSystemTail(system) {
       .filter((line) => !BILLING_LINE.test(line.trim()))
       .join('\n')
       .trim()
-    if (kept) parts.push(kept)
+    if (kept) {
+      const part = { type: 'text', text: kept }
+      if (block?.cache_control != null) part.cache_control = block.cache_control
+      parts.push(part)
+    }
   }
-  return parts.join('\n\n')
+  return parts
+}
+
+/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
+export function callerSystemTail(system) {
+  return callerSystemBlocks(system)
+    .map((block) => block.text)
+    .join('\n\n')
 }
 
 function stripCallerPromptAlias(body) {
@@ -130,20 +213,199 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
+function readOnlySummaryResults(messages) {
+  if (!Array.isArray(messages)) return messages
+  const index = messages.findLastIndex((message) => message?.role === 'user')
+  const message = messages[index]
+  if (!Array.isArray(message?.content) || !message.content.some((block) => block?.type === 'tool_result'))
+    return messages
+  // A summary fork observes these results; sending their IDs as live results
+  // would claim the parent's CRAG continuation, regardless of the new session ID.
+  const content = message.content.flatMap((block) => {
+    if (block?.type !== 'tool_result') return [block]
+    const label = { type: 'text', text: `[tool result ${block.tool_use_id}${block.is_error ? ' (error)' : ''}]` }
+    if (block.cache_control) label.cache_control = block.cache_control
+    const result = typeof block.content === 'string' ? [{ type: 'text', text: block.content }] : block.content || []
+    return [label, ...result]
+  })
+  const out = messages.slice()
+  out[index] = { ...message, content }
+  return out
+}
+
+const SYSTEM_REMINDER_OPEN = '<system-reminder>'
+
+function contentBlocks(content) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return Array.isArray(content) ? content : []
+}
+
+function reminderBlocks(message) {
+  const out = []
+  for (const block of contentBlocks(message?.content)) {
+    const text = textOf(block)
+    if (!text.trim()) continue
+    const wrapped = text.trimStart().startsWith(SYSTEM_REMINDER_OPEN)
+      ? text
+      : `${SYSTEM_REMINDER_OPEN}\n${text}\n</system-reminder>`
+    const part = { type: 'text', text: wrapped }
+    if (block && typeof block === 'object' && block.cache_control != null) part.cache_control = block.cache_control
+    out.push(part)
+  }
+  return out
+}
+
+function isEmptyText(block) {
+  return block && typeof block === 'object' && block.type === 'text' && block.text === ''
+}
+
+/** Leading tool_result blocks must stay first in a user turn. */
+function prependAfterToolResults(blocks, extra) {
+  let index = 0
+  while (blocks[index]?.type === 'tool_result') index += 1
+  return [...blocks.slice(0, index), ...extra, ...blocks.slice(index)]
+}
+
+/**
+ * Claude Code adds `role: "system"` turns to the history (environment
+ * updates, token counters, task notifications), usually one more per turn.
+ * The CRAG worker replays history through `--resume`, and a history that
+ * carries these turns is cached only up to tools + system on every request:
+ * the whole conversation is written again each turn. Folding each one into
+ * the adjacent user turn as a <system-reminder> keeps every earlier turn
+ * byte-stable, so the previous turn's breakpoint is found again.
+ *
+ * A system turn joins the user turn before it; one that follows an assistant
+ * turn joins the next user turn instead (after its tool_result blocks). Turns
+ * with no user turn to join keep their original shape.
+ */
+export function foldHistorySystemMessages(messages) {
+  if (!Array.isArray(messages) || !messages.some((message) => message?.role === 'system')) return messages
+  const out = []
+  let pending = []
+  let pendingSource = []
+  for (const message of messages) {
+    if (
+      message?.role === 'system' &&
+      !contentBlocks(message.content).every((block) => textOf(block) || isEmptyText(block))
+    ) {
+      // Media or other structured system content has no reminder form; keep it as sent.
+      out.push(...pendingSource, message)
+      pending = []
+      pendingSource = []
+      continue
+    }
+    if (message?.role === 'system') {
+      const blocks = reminderBlocks(message)
+      const previous = out.at(-1)
+      if (!pending.length && previous?.role === 'user') {
+        if (blocks.length)
+          out[out.length - 1] = { ...previous, content: [...contentBlocks(previous.content), ...blocks] }
+      } else {
+        pending = pending.concat(blocks)
+        pendingSource.push(message)
+      }
+      continue
+    }
+    if (pendingSource.length) {
+      if (message?.role === 'user') {
+        const merged = prependAfterToolResults(contentBlocks(message.content), pending)
+        out.push({ ...message, content: merged })
+        pending = []
+        pendingSource = []
+        continue
+      }
+      out.push(...pendingSource)
+      pending = []
+      pendingSource = []
+    }
+    out.push(message)
+  }
+  out.push(...pendingSource)
+  return out
+}
+
+/**
+ * An agent_summary fork ends with its instruction followed by token-budget
+ * system turns; the summary is recognized by that instruction being the last
+ * user text. Fold the shared history (so it matches the parent's prefix) but
+ * leave the trailing system run where the fork sent it.
+ */
+function foldSummaryHistorySystemMessages(messages) {
+  if (!Array.isArray(messages)) return messages
+  let end = messages.length
+  while (end > 0 && messages[end - 1]?.role === 'system') end -= 1
+  if (end === messages.length) return foldHistorySystemMessages(messages)
+  const head = messages.slice(0, end)
+  const folded = foldHistorySystemMessages(head)
+  return folded === head ? messages : [...folded, ...messages.slice(end)]
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean }} [options]
+ * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
-export function prepareCragPrintBody(body, { preset = 'official_full', officialPassthrough = false } = {}) {
+export function prepareCragPrintBody(
+  body,
+  {
+    preset = 'official_full',
+    officialPassthrough = false,
+    capabilities,
+    agentSummary = false,
+    foldSystemMessages = true,
+  } = {},
+) {
   const out = { ...(body || {}) }
+  if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  if (foldSystemMessages)
+    out.messages = agentSummary
+      ? foldSummaryHistorySystemMessages(out.messages)
+      : foldHistorySystemMessages(out.messages)
   const mode = preset === 'zero' ? 'replace' : 'append'
-  const tail = officialPassthrough ? '' : callerSystemTail(out.system)
   delete out.system
   stripCallerPromptAlias(out)
+  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
+    return out
+  const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
+  const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
+  if (
+    nativeV3 &&
+    !officialPassthrough &&
+    Array.isArray(body?.system) &&
+    body.system.some(
+      (block) =>
+        typeof block !== 'string' &&
+        (!block ||
+          block.type !== 'text' ||
+          typeof block.text !== 'string' ||
+          Object.keys(block).some((key) => !['type', 'text'].includes(key) && !(textCache && key === 'cache_control'))),
+    )
+  ) {
+    const message =
+      'CRAG V3 native system prompts support text only; structured system metadata requires isolated provider execution'
+    throw Object.assign(new Error(message), {
+      status: 400,
+      code: 'unsupported_capability',
+      body: {
+        type: 'error',
+        error: {
+          type: 'unsupported_capability',
+          code: 'unsupported_capability',
+          message,
+          details: { retryable: false },
+        },
+      },
+    })
+  }
+  const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
   if (!tail) return out
-  if (mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
+  if (!nativeV3 && mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
     throw cragPromptTooLarge(Buffer.byteLength(tail, 'utf8'))
   }
   out.crag_prompt = { mode, text: tail }
+  if (textCache) {
+    const blocks = callerSystemBlocks(body?.system)
+    if (blocks.some((block) => block.cache_control != null)) out.crag_prompt.blocks = blocks
+  }
   return out
 }

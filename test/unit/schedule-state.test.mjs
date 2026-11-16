@@ -258,6 +258,27 @@ test('resolveSlotState: off > unschedulable > restricted > on', () => {
   assert.equal(resolveSlotState({ vm: { schedulable: true }, availability: { key: 'ok' } }).schedule_state, 'on')
 })
 
+test('resolveSlotState does not call a down slot 调度开', () => {
+  const stopped = resolveSlotState({
+    vm: { schedulable: true, status: 'stopped' },
+    availability: { key: 'ok' },
+  })
+  assert.equal(stopped.schedule_state, 'unschedulable')
+  assert.equal(stopped.unschedulable_reason, 'vm_stopped')
+  assert.equal(stopped.unschedulable_text, '已关机')
+  const cooled = resolveSlotState({
+    vm: { schedulable: true, status: 'dead' },
+    availability: { key: 'quota', reason: 'quota_5h_header', until: Date.now() + 60_000 },
+  })
+  assert.equal(cooled.schedule_state, 'unschedulable')
+  assert.equal(cooled.unschedulable_reason, 'vm_dead')
+  assert.equal(
+    resolveSlotState({ vm: { schedulable: true, status: 'paused' }, availability: { key: 'ok' } }).schedule_state,
+    'on',
+  )
+  assert.equal(resolveSlotState({ vm: { schedule_off: true, status: 'stopped' } }).schedule_state, 'off')
+})
+
 test('resolveSlotState reads records written before the migration', () => {
   assert.equal(
     resolveSlotState({ vm: { schedulable: false, schedule_disabled_reason: 'oauth_revoked' } }).schedule_state,
@@ -273,4 +294,23 @@ test('resolveSlotState reads records written before the migration', () => {
     availability: { key: 'quota', reason: 'quota_5h_header' },
   })
   assert.equal(leftover.schedule_state, 'restricted')
+})
+
+test('host memory pressure shows as a new-session restriction on the panel', async (t) => {
+  const { installHostMemoryPressure } = await import('../../src/lib/cluster/host-memory-pressure.mjs')
+  const levels = { 'node-a': 'tight', local: 'critical' }
+  installHostMemoryPressure({ levelForVm: (vm) => levels[vm.node_id || 'local'] || 'ok' })
+  t.after(() => installHostMemoryPressure(null))
+  const tight = resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } })
+  assert.equal(tight.schedule_state, 'restricted')
+  assert.equal(tight.restriction_reason, 'host_memory_tight')
+  assert.equal(tight.restriction_scope, 'new_session')
+  assert.equal(tight.restriction_soft, true)
+  assert.equal(tight.restriction_text, '主机内存紧张')
+  const critical = resolveSlotState({ vm: { schedulable: true } })
+  assert.equal(critical.restriction_reason, 'host_memory_critical')
+  assert.equal(critical.restriction_soft, false)
+  assert.equal(critical.restriction_text, '主机内存告急')
+  levels.local = 'ok'
+  assert.equal(resolveSlotState({ vm: { schedulable: true } }).schedule_state, 'on')
 })

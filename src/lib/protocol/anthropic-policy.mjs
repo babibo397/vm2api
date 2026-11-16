@@ -555,14 +555,46 @@ export function rewriteToolNames(body = {}, { enabled = true } = {}) {
   return { body: out, reverse }
 }
 
+function restoreToolReferenceName(toolName, reverse) {
+  return typeof toolName === 'string' && reverse[toolName] ? reverse[toolName] : toolName
+}
+
+function restoreToolNameBlock(block, reverse) {
+  if (!block || typeof block !== 'object') return block
+  if (block.type === 'tool_use' && reverse[block.name]) {
+    return { ...block, name: reverse[block.name] }
+  }
+  if (block.type === 'tool_search_tool_result' && Array.isArray(block.tool_references)) {
+    let changed = false
+    const tool_references = block.tool_references.map((ref) => {
+      if (!ref || typeof ref !== 'object' || typeof ref.tool_name !== 'string') return ref
+      const tool_name = restoreToolReferenceName(ref.tool_name, reverse)
+      if (tool_name === ref.tool_name) return ref
+      changed = true
+      return { ...ref, tool_name }
+    })
+    return changed ? { ...block, tool_references } : block
+  }
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    let changed = false
+    const content = block.content.map((inner) => {
+      if (inner?.type !== 'tool_reference' || typeof inner.tool_name !== 'string') return inner
+      const tool_name = restoreToolReferenceName(inner.tool_name, reverse)
+      if (tool_name === inner.tool_name) return inner
+      changed = true
+      return { ...inner, tool_name }
+    })
+    return changed ? { ...block, content } : block
+  }
+  return block
+}
+
 export function restoreToolNames(response, reverse = {}) {
   if (!response || typeof response !== 'object' || Object.keys(reverse).length === 0) return response
   const out = clone(response)
   const restoreBlocks = (content) => {
     if (!Array.isArray(content)) return content
-    return content.map((block) =>
-      block?.type === 'tool_use' && reverse[block.name] ? { ...block, name: reverse[block.name] } : block,
-    )
+    return content.map((block) => restoreToolNameBlock(block, reverse))
   }
   out.content = restoreBlocks(out.content)
   if (out.message) out.message.content = restoreBlocks(out.message.content)
@@ -653,8 +685,8 @@ export function scrubUpstreamClientBody(body, { official = false, rewriteTools =
     })
   }
   if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = rename(out.tool_choice.name)
-    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => scrubMessage(message, rename))
@@ -670,6 +702,33 @@ function scrubTextBlock(block) {
   if (!block || typeof block !== 'object' || typeof block.text !== 'string') return block
   const text = scrubClientProse(block.text)
   return text === block.text ? block : { ...block, text }
+}
+
+function scrubToolReferenceFields(block, rename) {
+  if (!block || typeof block !== 'object') return { block, changed: false }
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    let changed = false
+    const content = block.content.map((inner) => {
+      if (inner?.type !== 'tool_reference' || typeof inner.tool_name !== 'string') return inner
+      const tool_name = rename(inner.tool_name)
+      if (tool_name === inner.tool_name) return inner
+      changed = true
+      return { ...inner, tool_name }
+    })
+    return changed ? { block: { ...block, content }, changed: true } : { block, changed: false }
+  }
+  if (block.type === 'tool_search_tool_result' && Array.isArray(block.tool_references)) {
+    let changed = false
+    const tool_references = block.tool_references.map((ref) => {
+      if (!ref || typeof ref !== 'object' || typeof ref.tool_name !== 'string') return ref
+      const tool_name = rename(ref.tool_name)
+      if (tool_name === ref.tool_name) return ref
+      changed = true
+      return { ...ref, tool_name }
+    })
+    return changed ? { block: { ...block, tool_references }, changed: true } : { block, changed: false }
+  }
+  return { block, changed: false }
 }
 
 function scrubMessage(message, rename) {
@@ -690,6 +749,11 @@ function scrubMessage(message, rename) {
         changed = true
         return { ...block, name }
       }
+    }
+    const refs = scrubToolReferenceFields(block, rename)
+    if (refs.changed) {
+      changed = true
+      return refs.block
     }
     if (systemTurn) {
       const next = scrubTextBlock(block)
@@ -723,6 +787,7 @@ export function composeToolNames(front = {}, hop = {}) {
  */
 export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
   const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
+  applyMaxTokensCap(shaped)
   return scrubUpstreamClientBody(shaped, { official, rewriteTools })
 }
 

@@ -1,10 +1,10 @@
-# Official v1.4.061 Linux amd64 release, with remote-slot, credit and lifecycle fixes.
+# Official v1.4.110 Linux amd64 release, with remote-slot, credit and lifecycle fixes.
 # Keep the base pinned so the image is reproducible and rollback is unambiguous.
-FROM ghcr.io/dofastted/vm2api:v1.4.061@sha256:a6be74b4a4ce970bb30f96a07853bf61d8f1c02e5c165b16e5f80bec1bd0a55d
+FROM ghcr.io/dofastted/vm2api:v1.4.110@sha256:5ffd18ed936c36b1ca0cdd35d9fd4787842c18657fc148f6377c52b69b7e0bf2
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/babibo397/vm2api" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
-      org.opencontainers.image.version="1.4.061-slot-lifecycle"
+      org.opencontainers.image.version="1.4.110-local"
 COPY src/server.mjs /opt/vm2api/src/server.mjs
 COPY src/lib/oauth/codex-quota-monitor.mjs src/lib/oauth/openai-quota.mjs /opt/vm2api/src/lib/oauth/
 COPY src/lib/protocol/codex-models.mjs /opt/vm2api/src/lib/protocol/codex-models.mjs
@@ -16,7 +16,7 @@ COPY src/lib/admin/api-keys.mjs /opt/vm2api/src/lib/admin/api-keys.mjs
 COPY src/lib/db/key-usage-reader.mjs src/lib/db/key-usage-worker.mjs /opt/vm2api/src/lib/db/
 COPY src/lib/db/repos/key-usage-range-repo.mjs /opt/vm2api/src/lib/db/repos/key-usage-range-repo.mjs
 COPY src/lib/vm/proxy-pool.mjs src/lib/vm/slot-runtime.mjs /opt/vm2api/src/lib/vm/
-COPY src/lib/cluster/slot-image.mjs src/lib/cluster/remote-slot-files.mjs src/lib/cluster/remote-slot.mjs /opt/vm2api/src/lib/cluster/
+COPY src/lib/cluster/slot-image.mjs src/lib/cluster/remote-slot.mjs /opt/vm2api/src/lib/cluster/
 RUN node --check /opt/vm2api/src/server.mjs \
   && node --check /opt/vm2api/src/lib/oauth/codex-quota-monitor.mjs \
   && node --check /opt/vm2api/src/lib/oauth/openai-quota.mjs \
@@ -32,5 +32,4 @@ RUN node --check /opt/vm2api/src/server.mjs \
   && node --check /opt/vm2api/src/lib/vm/slot-runtime.mjs \
   && node --check /opt/vm2api/src/lib/vm/proxy-pool.mjs \
   && node --check /opt/vm2api/src/lib/cluster/slot-image.mjs \
-  && node --check /opt/vm2api/src/lib/cluster/remote-slot-files.mjs \
   && node --check /opt/vm2api/src/lib/cluster/remote-slot.mjs

@@ -13,6 +13,7 @@ import {
   clearVmQuotaRestriction,
   markVmRestriction,
   expiresAtToMs,
+  ensureSlotSubscriptionType,
 } from '../oauth/oauth-credentials.mjs'
 import {
   HOLD_MAINTENANCE,
@@ -98,6 +99,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
       ? {
           kernel: vm.kernel_installation.kernel,
           version: vm.kernel_installation.version ?? null,
+          ...(vm.kernel_installation.payload_tag ? { payload_tag: vm.kernel_installation.payload_tag } : {}),
           installed_at: vm.kernel_installation.installed_at,
         }
       : null,
@@ -110,17 +112,24 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     codex_kernel: kind.kind === 'codex',
     email: kind.kind === 'codex' ? codex?.email || null : vm.claude?.email || null,
     account_uuid: kind.kind === 'codex' ? null : vm.claude?.account_uuid || null,
-    org_uuid: kind.kind === 'codex' ? vm.codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,
+    org_uuid: kind.kind === 'codex' ? codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,
     has_token: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
     expires_at: kind.kind === 'codex' ? codex?.expires_at || null : vm.claude?.expires_at || null,
     refreshed_at:
       kind.kind === 'codex' ? vm.codex?.usage?.snapshot?.updated_at || null : vm.claude?.refreshed_at || null,
     oauth_source: kind.kind === 'codex' ? 'codex-credentials' : vm.claude?.source || null,
+    oauth_registration:
+      kind.kind !== 'codex' &&
+      (vm.claude?.oauth_registration === 'console' ||
+        (!vm.claude?.oauth_registration && ['claude-setup-token', 'oauth-setup-token'].includes(vm.claude?.source)))
+        ? 'console'
+        : 'oauth',
     credential_mode: kind.kind === 'codex' ? 'oauth' : vm.claude?.mode || 'oauth',
     can_claude_reset: canClaudeResetCredits(vm, {
       hasToken: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
     }),
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
+    account_tier_source: kind.kind === 'codex' ? null : vm.claude?.account_tier_source || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
     refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
     account_tier:
@@ -237,6 +246,9 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.claude = vm.claude || {}
   if (vm.claude.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return vm
+  if (source === 'profile' || source === 'usage') {
+    ensureSlotSubscriptionType(path.join(projectRoot, 'vms', vmId, 'cli-home'), key, { source })
+  }
   if (vm.claude.account_tier === key && (vm.claude.account_tier_source || null) === source) return vm
   vm.claude.account_tier = key
   vm.claude.account_tier_source = source

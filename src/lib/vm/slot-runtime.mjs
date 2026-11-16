@@ -19,7 +19,7 @@ import {
 } from '../transport/codex-kernel-supervisor.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
-import { resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
+import { resolveCragKernelVersion, resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
   containerName,
@@ -76,7 +76,8 @@ export async function stopSlot(vm) {
 /** Stop host inference before reset/delete may remove the container and its home. */
 export async function destroySlot(vm, projectRoot, opts = {}) {
   const destroy = async () => {
-    const gone = await (opts.ops?.destroySlot ? opts.ops.destroySlot(vm) : slotHost(vm).destroy(vm))
+    const remove = opts.ops?.destroySlot || slotHost(vm).destroy
+    const gone = await remove(vm, { requireConfirmation: opts.requireConfirmation })
     if (gone?.ok && opts.afterDestroy) await opts.afterDestroy(gone)
     return gone
   }
@@ -232,6 +233,7 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   const rust = await start(exec, {
     timeoutMs: opts.timeoutMs,
     allowMissingCredential: opts.allowMissingCredential === true,
+    ...(opts.prepareGuestAppArmor === true ? { prepareGuestAppArmor: true } : {}),
   })
   if (!rust?.ok) {
     return {
@@ -245,7 +247,13 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
 }
 
 async function attachInferenceRuntime(boot, vm, projectRoot, opts = {}) {
-  const rust = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
+  // Old overlays can auto-start a healthy core before their first native Claude launch fails.
+  const prepareGuestAppArmor =
+    isKvmRuntime(vm) &&
+    ['started', 'created'].includes(boot.action) &&
+    resolveKernelDataplane(vm, opts.routing || {}) === 'crag' &&
+    resolveCragKernelVersion(vm, opts.routing || {}) === 'v2'
+  const rust = await ensureSlotInferenceRuntime(vm, projectRoot, { ...opts, prepareGuestAppArmor })
   const engine = resolveInferenceEngine(vm, opts.routing || {})
   if (vm.runtime && typeof vm.runtime === 'object') vm.runtime.worker = engine
   return {

@@ -3,6 +3,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import {
+  readWorkerCredentialFile,
+  writeWorkerCredentialFile,
+  ensureSlotSubscriptionType,
+} from '../../src/lib/oauth/oauth-credentials.mjs'
 const { buildProbeOne, buildVmDetail } = await import('../../src/lib/admin/panel-api.mjs')
 const { AccountQuota } = await import('../../src/lib/pool/account-quota.mjs')
 const { createDatabase } = await import('../../src/lib/db/database.mjs')
@@ -15,6 +20,152 @@ function usageCache(probe) {
     },
   }
 }
+
+test('official Pro profile repairs a stale Max plan in DB, VM, credential and panel views', async (t) => {
+  const f = fixture(t, { mode: 'oauth' })
+  const root = f.args.cfg.paths.project
+  const home = path.join(root, 'vms/vm-02/cli-home')
+  writeWorkerCredentialFile(home, { access_token: 'at-test', refresh_token: 'rt-test', subscription_type: 'max' })
+  f.quota.setAccountTier('account-test', 'max')
+  // Unknown/default Pro hints still must not overwrite a real credential plan.
+  ensureSlotSubscriptionType(home, 'pro')
+  assert.equal(readWorkerCredentialFile(home).subscription_type, 'max')
+  const result = (
+    await buildProbeOne({
+      ...f.args,
+      accountQuota: f.quota,
+      usageCache: usageCache({
+        ok: true,
+        source: 'official-cc-usage',
+        usage_status: 200,
+        limits_present: true,
+        five_hour: { utilization: 0.1 },
+        seven_day: { utilization: 0.2 },
+        seven_day_oi: { utilization: 0.1 },
+        usage_has_fable: null,
+        account_tier: 'pro',
+        account_tier_source: 'profile',
+      }),
+    })
+  ).data
+  assert.equal(result.account_tier, 'pro')
+  assert.equal(result.quota.account_tier, 'pro')
+  assert.equal(f.quota.repo.get('account-test').unified.account_tier_source, 'profile')
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'vms/vm-02.json'))).claude.account_tier, 'pro')
+  assert.equal(readWorkerCredentialFile(home).subscription_type, 'pro')
+  const detail = await f.detail(f.reopen())
+  assert.equal(detail.vm.account_tier, 'pro')
+})
+
+for (const explicitTier of [false, true]) {
+  test(`Pro rate veto survives ${explicitTier ? 'explicit usage tier' : 'inferred usage'} probe and DB reopen`, async (t) => {
+    const f = fixture(t, { mode: 'oauth' })
+    const root = f.args.cfg.paths.project
+    const vmFile = path.join(root, 'vms/vm-02.json')
+    const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    vm.claude.rate_limit_tier = 'default_claude_ai'
+    vm.claude.account_tier = 'max'
+    vm.claude.account_tier_source = 'usage'
+    fs.writeFileSync(vmFile, JSON.stringify(vm))
+    const home = path.join(root, 'vms/vm-02/cli-home')
+    writeWorkerCredentialFile(home, {
+      access_token: 'at-test',
+      refresh_token: 'rt-test',
+      subscription_type: 'pro',
+      rate_limit_tier: 'default_claude_ai',
+    })
+    f.quota.setAccountTier('account-test', 'max', { source: 'usage' })
+    const result = (
+      await buildProbeOne({
+        ...f.args,
+        accountQuota: f.quota,
+        usageCache: usageCache({
+          ok: true,
+          source: 'official-cc-usage',
+          usage_status: 200,
+          limits_present: true,
+          five_hour: { utilization: 0.1 },
+          seven_day: { utilization: 0.2 },
+          seven_day_oi: { utilization: 0.1 },
+          usage_has_fable: true,
+          ...(explicitTier ? { account_tier: 'max', account_tier_source: 'usage' } : {}),
+        }),
+      })
+    ).data
+    assert.equal(result.account_tier, 'pro')
+    assert.equal(result.quota.account_tier, 'pro')
+    assert.equal(f.quota.repo.get('account-test').unified.account_tier, 'pro')
+    assert.equal(JSON.parse(fs.readFileSync(vmFile, 'utf8')).claude.account_tier, 'pro')
+    assert.equal(readWorkerCredentialFile(home).subscription_type, 'pro')
+    const detail = await f.detail(f.reopen())
+    assert.equal(detail.vm.account_tier, 'pro')
+    assert.equal(detail.vm.usage_has_fable, true)
+  })
+}
+
+for (const tier of ['pro', 'max']) {
+  test(`usage cannot replace a verified ${tier} profile when the next profile is unavailable`, async (t) => {
+    const f = fixture(t, { mode: 'oauth' })
+    const root = f.args.cfg.paths.project
+    const vmFile = path.join(root, 'vms/vm-02.json')
+    const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    vm.claude = {
+      ...vm.claude,
+      account_tier: tier,
+      account_tier_source: 'profile',
+      rate_limit_tier: 'default_claude_ai',
+    }
+    fs.writeFileSync(vmFile, JSON.stringify(vm))
+    f.quota.setAccountTier('account-test', tier, { source: 'profile' })
+    const home = path.join(root, 'vms/vm-02/cli-home')
+    writeWorkerCredentialFile(home, { access_token: 'at-test', refresh_token: 'rt-test', subscription_type: tier })
+    const result = (
+      await buildProbeOne({
+        ...f.args,
+        accountQuota: f.quota,
+        usageCache: usageCache({
+          ok: true,
+          source: 'official-cc-usage',
+          usage_status: 200,
+          limits_present: true,
+          five_hour: { utilization: 0.1 },
+          seven_day: { utilization: 0.2 },
+          seven_day_oi: { utilization: 0.1 },
+          usage_has_fable: true,
+          account_tier: 'max',
+          account_tier_source: 'usage',
+        }),
+      })
+    ).data
+    assert.equal(result.account_tier, tier)
+    assert.equal(result.quota.account_tier, tier)
+    assert.equal(f.quota.repo.get('account-test').unified.account_tier_source, 'profile')
+    assert.equal(readWorkerCredentialFile(home).subscription_type, tier)
+    const detail = await f.detail(f.reopen())
+    assert.equal(detail.vm.account_tier, tier)
+    assert.equal(detail.vm.account_tier_source, 'profile')
+  })
+}
+
+test('panel serializes quota-only profile provenance ahead of stale VM usage and subscription', async (t) => {
+  const f = fixture(t, { mode: 'oauth' })
+  const root = f.args.cfg.paths.project
+  const vmFile = path.join(root, 'vms/vm-02.json')
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  vm.claude = {
+    ...vm.claude,
+    account_tier: 'max',
+    account_tier_source: 'usage',
+    subscription_type: 'max',
+    rate_limit_tier: 'default_claude_max_5x',
+  }
+  fs.writeFileSync(vmFile, JSON.stringify(vm))
+  f.quota.setAccountTier('account-test', 'pro', { source: 'profile' })
+  const detail = await f.detail()
+  assert.equal(detail.vm.account_tier, 'pro')
+  assert.equal(detail.vm.account_tier_source, 'profile')
+  assert.equal(detail.vm.subscription_type, 'max', 'subscription metadata stays separate from scheduling inference')
+})
 
 function fixture(t, { mode = 'setup-token', headers = true, failed = false } = {}) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-card-'))

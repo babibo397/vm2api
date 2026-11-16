@@ -21,6 +21,7 @@ import {
   CODEX_SLOT_ROLE,
 } from '../../src/lib/vm/vm-runtime.mjs'
 import { slotNetworkForVm } from '../../src/lib/vm/egress.mjs'
+import { kernelCpuCommand } from '../../src/lib/vm/kernel-cpu.mjs'
 
 const running = { running: true, networkMode: 'host', image: 'kin-os/ubuntu:24.04' }
 const stopped = { running: false, networkMode: 'host', image: 'kin-os/ubuntu:24.04' }
@@ -165,16 +166,16 @@ test('crash-looping kvm runner is replaced and recreated on reload even on the r
   )
 })
 
-test('ensureSlotImage refreshes a cached tag and falls back to it when the registry is unreachable', () => {
+test('ensureSlotImage refreshes a cached tag and falls back to it when the registry is unreachable', async () => {
   const calls = []
   const registry = (pullOk) => (argv) => {
     calls.push(argv.slice(0, 3).join(' '))
     return { ok: argv[1] === 'pull' ? pullOk : true }
   }
-  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(true) }).action, 'pulled')
+  assert.equal((await ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(true) })).action, 'pulled')
   assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12'])
   calls.length = 0
-  assert.equal(ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(false) }).action, 'present')
+  assert.equal((await ensureSlotImage('debian-12', { runtime: 'kvm', run: registry(false) })).action, 'present')
   assert.deepEqual(calls, ['docker pull ghcr.io/dofastted/kin-kvm-debian:12', 'docker image inspect'])
 })
 
@@ -418,12 +419,10 @@ test('a GPT slot container idles instead of booting the Claude kernel', () => {
   const codex = { id: 'vm-codex-01', platform: 'openai', family: 'codex', codex_kernel: true }
   const claude = { id: 'vm-03', platform: 'anthropic' }
   assert.deepEqual(slotContainerCommand(codex, { wrapKernel: true }), ['sleep', 'infinity'])
-  assert.deepEqual(slotContainerCommand(claude, { wrapKernel: true }), [
-    '/home/kincli/.kin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
-  ])
+  assert.deepEqual(
+    slotContainerCommand(claude, { wrapKernel: true }),
+    kernelCpuCommand(['/home/kincli/.kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json']),
+  )
 })
 
 test('a GPT slot container is live without kernel.sock, and an old kin-kernel one is recreated once', (t) => {
@@ -461,4 +460,29 @@ test('writeWorkerFiles and startVmRuntime use defaults when routing.json is abse
     else delete process.env.KIN_ROUTING_FILE
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('image pull and build leave the event loop responsive', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-image-async-'))
+  const oldPath = process.env.PATH
+  t.after(() => {
+    process.env.PATH = oldPath
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  fs.writeFileSync(
+    path.join(dir, 'docker'),
+    `#!${process.execPath}
+const operation = process.argv[2]
+setTimeout(() => process.exit(operation === 'build' ? 0 : 1), 150)
+`,
+    { mode: 0o755 },
+  )
+  process.env.PATH = `${dir}${path.delimiter}${oldPath}`
+  let ticks = 0
+  const timer = setInterval(() => ticks++, 10)
+  t.after(() => clearInterval(timer))
+  const result = await ensureSlotImage('debian-12', { runtime: 'kvm' })
+  assert.equal(result.ok, true)
+  assert.equal(result.action, 'built')
+  assert.ok(ticks >= 5, `event loop stalled: only ${ticks} timer ticks`)
 })

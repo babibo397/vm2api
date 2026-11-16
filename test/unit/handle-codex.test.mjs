@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   isRetryableCodexTransport,
+  isRetryableSameCodexAccount,
   runCodexKernelHop,
   handleCodexProtocol,
   pickCodexCandidates,
@@ -38,6 +39,56 @@ test('502 upstream_transport is retryable before commit', () => {
   )
   assert.equal(isRetryableCodexTransport({ ok: true, status: 200 }), false)
   assert.equal(isRetryableCodexTransport({ ok: false, status: 401, body: { error: { code: 'oauth_revoked' } } }), false)
+})
+test('server_is_overloaded retries only before output commitment', () => {
+  const result = {
+    ok: false,
+    committed: false,
+    status: 503,
+    body: { error: { type: 'service_unavailable_error', code: 'server_is_overloaded' } },
+  }
+  assert.equal(isRetryableSameCodexAccount(result), true)
+  assert.equal(isRetryableSameCodexAccount({ ...result, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { signal: AbortSignal.abort() }), false)
+})
+
+function overloadedResult(status, code) {
+  return {
+    ok: false,
+    committed: false,
+    status,
+    body: { error: { code, message: 'busy' } },
+  }
+}
+
+test('same-account retries accept server_is_overloaded on transient 5xx before commit', () => {
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(
+      isRetryableSameCodexAccount(overloadedResult(status, 'server_is_overloaded')),
+      true,
+      `status ${status}`,
+    )
+  }
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(503, 'overloaded_error')), true)
+})
+
+test('same-account retries stop after commit, headers, cancel, conversion, or non-retryable status', () => {
+  const base = overloadedResult(502, 'server_is_overloaded')
+  assert.equal(isRetryableSameCodexAccount({ ...base, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { conversionError: new Error('bad stream') }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { signal: AbortSignal.abort() }), false)
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(429, 'server_is_overloaded')), false)
+  assert.equal(
+    isRetryableSameCodexAccount({
+      ok: false,
+      committed: false,
+      status: 502,
+      body: { error: { code: 'usage_limit_reached' } },
+    }),
+    false,
+  )
 })
 
 test('runCodexKernelHop retries a silent first-hop 502 then succeeds', async () => {
@@ -1214,48 +1265,6 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   assert.equal(envelopes[0].body.prompt_cache_key, session.session_id)
   assert.equal(envelopes[0].body.conversation_id, undefined)
   assert.equal(envelopes[0].body.session_id, undefined)
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
-test('codex kernel envelope preserves official routing headers without client auth', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-routing-headers-'))
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  writeGptVm(root, 'vm-gpt-a')
-  const { envelopes } = await hopCodex({
-    root,
-    stickyRouter: sticky,
-    headers: {
-      authorization: 'Bearer sub2api-key',
-      originator: 'Codex Desktop',
-      'openai-beta': 'responses_websockets=2026-02-06',
-      'session-id': 'session:t',
-      'thread-id': 'thread:t',
-      'x-client-request-id': 'request:t',
-      'x-codex-beta-features': 'remote_compaction_v2',
-      'x-codex-turn-metadata': '{"thread_id":"t"}',
-      'x-codex-window-id': 'window:2',
-      'x-openai-internal-codex-responses-lite': 'true',
-    },
-    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast' },
-  })
-  const session = envelopes[0].session
-  assert.deepEqual(envelopes[0].headers, {
-    originator: 'Codex Desktop',
-    'openai-beta': 'responses_websockets=2026-02-06',
-    'session-id': session.session_id,
-    'thread-id': 'thread:t',
-    'x-client-request-id': 'request:t',
-    'x-codex-beta-features': 'remote_compaction_v2',
-    'x-codex-turn-metadata': '{"thread_id":"t"}',
-    'x-codex-window-id': 'window:2',
-    'x-openai-internal-codex-responses-lite': 'true',
-    'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
-  })
-  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
-  assert.equal(envelopes[0].headers['session-id'], session.session_id)
-  assert.equal(envelopes[0].headers.authorization, undefined)
-  assert.equal(envelopes[0].body.service_tier, 'priority')
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
 })

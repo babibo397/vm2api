@@ -36,9 +36,12 @@ import {
   resolveKernelDataplane,
 } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { slotCreationLimits } from '../vm/slot-capacity.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFields } from '../vm/kvm-machine.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
@@ -112,7 +115,7 @@ export function clusterDockerCommandReady(vm, info, routing) {
     resolveKernelDataplane(vm, routing || {}) === 'crag' && resolveCragKernelVersion(vm, routing || {}) === 'v2'
   if (crag) return clusterCragContainerReady(info)
   const cmd = info?.Config?.Cmd || []
-  return Array.isArray(cmd) && cmd[0] === REMOTE_KERNEL_ENTRY
+  return Array.isArray(cmd) && (cmd[0] === REMOTE_KERNEL_ENTRY || kernelCpuCommandMatches(cmd, REMOTE_KERNEL_ENTRY))
 }
 
 export function clusterCragContainerReady(info) {
@@ -687,6 +690,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
       `KIN_KVM_MACHINE_ID=${machineId}`,
       `KIN_KVM_ACCEL=${accel}`,
       'KIN_KVM_SHARES=home,run,claude',
+      ...(usesKernelCpuLimit(vm, routing) ? ['KIN_KVM_KERNEL_CPU_LIMIT=1'] : []),
     ],
     Labels: {
       'kin.vm': '1',
@@ -727,12 +731,14 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
 export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel }) {
   if (isKvmRuntime(vm)) return kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser: user })
   const slotName = displayName(vm.id)
-  const mem = parseMemoryBytes(slotMemory(vm, routing))
+  const limits = slotCreationLimits(vm, routing)
+  const mem = parseMemoryBytes(limits.memory)
   const cpus = slotDockerCpus(vm)
   const codex = isCodexVm(vm)
   const crag =
     !codex && resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
   const entry = crag ? REMOTE_CRAG_ENTRY : REMOTE_KERNEL_ENTRY
+  const argv = [entry, '--gateway-worker', '--config', '/run/kin/kernel.json']
   return {
     Image: image,
     Hostname: String(vm.fingerprint?.hostname || '').trim() || slotName,
@@ -748,7 +754,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       `KIN_VM_OS=${vm.kernel}`,
     ],
     // Node images bake the Claude kernel here; local slots bind-mount a different path.
-    Cmd: codex ? ['sleep', 'infinity'] : [entry, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+    Cmd: codex ? ['sleep', 'infinity'] : usesKernelCpuLimit(vm, routing) ? kernelCpuCommand(argv) : argv,
     Labels: {
       'kin.vm': '1',
       'kin.vm.id': vm.id,
@@ -776,7 +782,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       // (MemorySwap == Memory would forbid swap entirely).
       MemorySwap: mem * 2,
       ...(cpus > 0 ? { NanoCpus: Math.round(cpus * 1e9) } : {}),
-      PidsLimit: 256,
+      PidsLimit: limits.pids,
       ReadonlyRootfs: true,
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=32m' },
       SecurityOpt: crag
@@ -867,9 +873,8 @@ export async function refreshNodeSlotPayload(
     const session = await sessionFor(nodeId)
     // Older images have no CRAG layer. The slot-bin mount is already there, so publish
     // the tree without recreating a container whose image is otherwise current.
-    if (session?.client) {
-      await pushCragSlot(vm, projectRoot, session, { required: resolveKernelDataplane(vm, routing) === 'crag' })
-    }
+    if (session?.client)
+      await pushCragSlot(vm, projectRoot, session, { required: resolveKernelDataplane(vm, routing || {}) === 'crag' })
     const running = recreate !== false && vm.status === 'running'
     // A current image stays up only when its command matches this slot's kernel.
     if (running) {
@@ -1021,16 +1026,6 @@ export async function refreshClusterSlotPayloads(
   for (const vm of vms || []) {
     // Codex inference is the host Codex kernel; this update targets Claude CLI payloads.
     if (isCodexVm(vm)) continue
-    if (isKvmRuntime(vm) && (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag')) {
-      items.push({
-        id: vm.id,
-        ok: false,
-        code: 'remote_unsupported',
-        error: 'crag 数据面暂不支持 KVM 槽',
-        kernel_changed: false,
-      })
-      continue
-    }
     const nodeId = vmNodeId(vm)
     const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
     const kind = runtimeKind(vm)
@@ -1056,9 +1051,6 @@ export async function refreshClusterSlotPayloads(
 }
 
 async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) {
-  if (isKvmRuntime(vm) && resolveKernelDataplane(vm, routing || {}) === 'crag') {
-    return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' } }
-  }
   if (resolveKernelDataplane(vm, routing) === 'crag') cragSlotPayload(projectRoot)
   vm.kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.timezone = normalizeTimezone(vm.timezone)
@@ -1252,8 +1244,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       await chownRemoteKvmBinds(session, name, vm)
       const argv = slotExecArgv(
         { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: 'kvm' } },
-        ['systemctl', 'restart', 'kin-kernel.service'],
-        { user: '0' },
+        kvmCragAppArmorCommand({ restart: true }),
+        { user: '0', interactive: true },
       )
       await runRemote(session.client, ['docker', ...argv].map(shellQuote).join(' '), { timeoutMs: 60_000 })
     } else {

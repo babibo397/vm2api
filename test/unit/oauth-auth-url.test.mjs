@@ -45,17 +45,12 @@ test('generateAuthUrl builds Claude authorize URL and stores PKCE', () => {
   assert.equal(session.redirectUri, REDIRECT_URI)
 })
 
-test('generateAuthUrl refuses host-built claude_code links', () => {
-  resetAuthUrlSessions()
-  assert.throws(
-    () =>
-      generateAuthUrl({
-        vmId: 'vm-01',
-        proxyUrl: 'socks5h://127.0.0.1:1080',
-        flavor: 'claude_code',
-      }),
-    (err) => err.code === 'claude_code_in_slot',
-  )
+test('Claude Code flavors cannot create a separate panel PKCE session', () => {
+  for (const flavor of ['claude_code', 'claude-code', 'cc', 'official']) {
+    assert.throws(() => generateAuthUrl({ vmId: 'vm-01', proxyUrl: '', flavor }), {
+      code: 'native_login_required',
+    })
+  }
 })
 
 test('generateAuthUrl setup_token uses full scope on CAI but keeps setup-token flavor', () => {

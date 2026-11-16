@@ -1,9 +1,9 @@
 /**
  * Browser OAuth-link import.
- * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange inside the target VM using its bound egress. proxyUrl still
- * validates the authorize session, but production execution uses the VM context;
- * null means unbound and is refused.
+ * CAI and Setup Token share PKCE + paste-code, then exchange using the target
+ * VM's bound egress. Native Claude Code login does not use this helper. Legacy kernels use the
+ * controller helper with the same exit. The VM context selects the live binding;
+ * proxyUrl validates the authorize session and null means unbound.
  */
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
@@ -22,18 +22,6 @@ export const OAUTH_FLAVORS = Object.freeze({
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
     scope: FULL_OAUTH_SCOPE,
     source: 'oauth-auth-url',
-  },
-  claude_code: {
-    flavor: 'claude_code',
-    authorizeUrl: 'https://claude.ai/oauth/authorize',
-    redirectUri: 'https://console.anthropic.com/oauth/code/callback',
-    tokenUrls: [
-      'https://platform.claude.com/v1/oauth/token',
-      'https://api.anthropic.com/v1/oauth/token',
-      'https://console.anthropic.com/v1/oauth/token',
-    ],
-    scope: FULL_OAUTH_SCOPE,
-    source: 'oauth-claude-code',
   },
   setup_token: {
     flavor: 'setup_token',
@@ -101,7 +89,9 @@ export function normalizeOauthFlavor(raw) {
 }
 
 export function oauthFlavorSpec(raw) {
-  return OAUTH_FLAVORS[normalizeOauthFlavor(raw)]
+  const flavor = normalizeOauthFlavor(raw)
+  if (flavor === 'claude_code') throw fail('native_login_required', 'Claude Code 授权须在槽位原生终端完成')
+  return OAUTH_FLAVORS[flavor]
 }
 
 export function resetAuthUrlSessions() {
@@ -122,9 +112,6 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
 
 export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   sweepExpired()
-  if (normalizeOauthFlavor(flavor) === 'claude_code') {
-    throw fail('claude_code_in_slot', '官方 Claude Code 登录必须由槽内 cli-node 执行，不能由宿主机生成授权链接')
-  }
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
   if (normalizeSocks(proxyUrl) == null) {
     throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')
@@ -164,8 +151,8 @@ function parseAuthCode(fullCode) {
 }
 
 async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options = {}) {
-  // With an execution context the helper runs inside the target VM and
-  // selects that VM's bound egress. The host proxy is only a test/direct path.
+  // The execution context resolves the VM's current bound exit, including
+  // controller execution for legacy kernels. Do not reuse a stale session proxy.
   const px = options.exec ? null : normalizeSocks(proxyUrl)
   if (px == null && !options.exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
   return exchangeTokenViaCookieAuth({
@@ -239,8 +226,8 @@ export async function exchangeAuthCode({
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
   const identity = flattenOauthIdentity(token)
-  // kin-oauth-auth completes bootstrap inside the VM, through the same bound
-  // egress as token exchange. Do not bootstrap again from the control plane.
+  // kin-oauth-auth completes bootstrap through the same bound exit as the
+  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
   return carryOAuthAttempt(token, {
     access_token: token.access_token,
     refresh_token: token.refresh_token || '',

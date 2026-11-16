@@ -235,6 +235,12 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
   }
 }
 
+/** crag-v2: `process_error` "Claude process exited (None): Claude native process exited with code …". */
+export function isNativeProcessExit(workerCode, text) {
+  if (workerCode === 'process_error') return true
+  return /native process exited|claude process exited/i.test(String(text || ''))
+}
+
 function claudeStopReasonOf(result) {
   return assistantStopReason(result)
 }
@@ -335,6 +341,21 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  const handoffCode = result?.body?.error?.code
+  if (
+    result.nativeHandoff === true &&
+    /^native_handoff_(missing|invalid|conflict|incomplete)$/.test(handoffCode || '')
+  ) {
+    // The provider may already have finished. Missing terminal proof is not
+    // permission to execute the same turn again or penalize another account.
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: handoffCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (isContentFilterRefusal(result) && !result.committed) {
     return cacheRefusal('content_filter_refusal')
   }
@@ -361,9 +382,22 @@ function classifyUpstreamResultRaw(
   const reset = resetFromHeaders(result.headers, now)
 
   const hay = `${code} ${message} ${workerCode}`
+  if (/Claude native launch failed/i.test(message)) {
+    return {
+      scope: 'worker',
+      action: 'stop',
+      reason: /Permission denied|Operation not permitted|os error (?:1|13)\b/i.test(message)
+        ? 'native_launch_permission_denied'
+        : 'native_launch_failed',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (
     [code, workerCode].some((value) =>
-      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(value),
+      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+        value,
+      ),
     )
   ) {
     return {
@@ -495,6 +529,9 @@ function classifyUpstreamResultRaw(
     })
   }
   if (status === 400) {
+    if (code === 'invalid_kernel_request') {
+      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
     // client sees 200 and never learns the upstream rejected the signature.
@@ -649,6 +686,15 @@ function classifyUpstreamResultRaw(
         retrySameAccount: false,
       })
     }
+    // The VM's native Claude process died before answering (cgroup OOM or pids
+    // limit, crash). The account is fine: try another unit, open no circuit.
+    if (isNativeProcessExit(workerCode, hay)) {
+      return continueWithoutCooldown({
+        scope: 'worker',
+        reason: 'worker_process_exit',
+        retrySameAccount: false,
+      })
+    }
     if (isFableModel(model) && (status === 408 || status === 504 || /timeout/i.test(message))) {
       return {
         scope: 'model',
@@ -674,7 +720,10 @@ function classifyUpstreamResultRaw(
         retrySameAccount: true,
       })
     }
-    return overloadedUnit(now)
+    return {
+      ...overloadedUnit(now),
+      reason: /overload/i.test(message) ? 'provider_overloaded' : 'upstream_server_error',
+    }
   }
   return { scope: 'request', action: 'stop', reason: `http_${status}`, cooldownUntil: null }
 }

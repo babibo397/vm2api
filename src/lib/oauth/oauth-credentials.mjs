@@ -127,24 +127,6 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
-const AUTH_LOGIN_REFRESH_HOLD_MS = 30 * 60 * 1000
-
-/** A live `claude auth login` is about to exchange a new grant. Do not spend the old RT. */
-export function authLoginBlocksRefresh(homeDir, now = Date.now()) {
-  if (!homeDir) return false
-  try {
-    const status = JSON.parse(fs.readFileSync(path.join(homeDir, '..', 'run', 'auth-login', 'status.json'), 'utf8'))
-    const state = String(status.status || '')
-    if (!state || state === 'login_ready' || state === 'error' || state === 'exited') return false
-    const expires = Number(status.expires_at || 0)
-    if (expires > 0) return now < expires
-    const created = Number(status.created_at || 0)
-    return !created || now < created + AUTH_LOGIN_REFRESH_HOLD_MS
-  } catch {
-    return false
-  }
-}
-
 function regularOauthGrant(file) {
   let st
   try {
@@ -187,15 +169,13 @@ function officialGrantWins(official, worker) {
  * grant is copied onto the worker file first. Deleting it and refreshing
  * the older RT is what revokes the new grant.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false, adoptOfficial = true } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
-  const officialGrant = regularOauthGrant(officialFile)
-  const workerGrant = regularOauthGrant(workerFile)
-  const adopt = officialGrantWins(officialGrant, workerGrant)
-  if (!workerGrant && !fs.existsSync(workerFile)) {
+  const adopt = adoptOfficial && officialGrantWins(regularOauthGrant(officialFile), regularOauthGrant(workerFile))
+  if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
     if (adopt) fs.copyFileSync(officialFile, workerFile)
@@ -219,8 +199,8 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   try {
     const st = fs.lstatSync(officialFile)
     if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(officialFile)
-      if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
+      // An absolute host path can resolve here but dangle inside a container or KVM guest.
+      if (fs.readlinkSync(officialFile) === 'credentials.json') {
         return { wrote: true, path: officialFile, linked: true, adopted: adopt }
       }
     }
@@ -443,7 +423,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
     )
     chownSlotCredentialFile(homeDir, file)
     sealSlotCredentialFile(file)
-    ensureOfficialCredentialLink(homeDir)
+    ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
     return file
   }
   const n = normalizeOauth(cred)
@@ -492,15 +472,15 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   atomicWriteJson(file, { type: mode, authScheme, kinGeneration: generation, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
-  ensureOfficialCredentialLink(homeDir)
+  ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
   return file
 }
 
 /**
  * Old slot files predate subscriptionType. Fill from the identified plan,
- * otherwise pro; repair the legacy pro fallback for an identified Max slot.
+ * otherwise pro. Only authoritative profile/usage can downgrade an old Max.
  */
-export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
+export function ensureSlotSubscriptionType(homeDir, accountTier = null, { source = null } = {}) {
   const file = slotWorkerCredentialPath(homeDir)
   if (!file || !fs.existsSync(file)) return { wrote: false, reason: 'missing' }
   let doc
@@ -514,8 +494,13 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
   const present = normalizeSubscriptionType(oauth.subscriptionType)
   const identified = normalizeSubscriptionType(accountTier)
   // Startup summaries used to lose the identified tier and write pro. A pro
-  // hint may itself be a default, so it must not downgrade an existing plan.
-  if (present && !(present === 'pro' && identified === 'max')) {
+  // hint may itself be a default; only an explicit source can downgrade a plan.
+  const authoritative = source === 'profile' || source === 'usage'
+  if (
+    present &&
+    !(present === 'pro' && identified === 'max') &&
+    !(authoritative && identified && present !== identified)
+  ) {
     chownSlotCredentialFile(homeDir, file)
     return { wrote: false, reason: 'present' }
   }
@@ -635,6 +620,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
   }
   if (n.source) vm.claude.source = n.source
   vm.claude.mode = mode
+  if (operatorImport) vm.claude.oauth_registration = cred.oauth_registration === 'console' ? 'console' : 'oauth'
   if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
     vm.claude.account_tier = 'pro'
     vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'

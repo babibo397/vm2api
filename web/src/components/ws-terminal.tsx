@@ -10,7 +10,12 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '@/lib/api'
-import { captureLoginAuthUrl } from '@/lib/login-terminal'
+import {
+  captureLoginAuthUrl,
+  loginAuthUrl,
+  parseTerminalFrame,
+  type LoginCommit,
+} from '@/lib/login-terminal'
 import { apiBase } from '@/lib/session'
 import {
   eraseEcho,
@@ -22,12 +27,14 @@ import { Button } from '@/components/ui/button'
 
 type Phase = 'connecting' | 'open' | 'closed'
 
-/** 面板侧快捷指令：不进 shell，结果逐行写进终端。 */
+/** 快捷指令可调用面板接口，或在空提示符发送槽内命令。 */
 export type SlashCommand = {
   name: string
   desc: string
-  run: () => Promise<string[]>
-}
+} & (
+  | { run: () => Promise<string[]>; input?: never }
+  | { input: string; run?: never }
+)
 
 const RED = '\x1b[31m'
 const DIM = '\x1b[2m'
@@ -55,7 +62,7 @@ function withBuiltins(own: SlashCommand[]): SlashCommand[] {
  * 30s 一次性 ticket。传入 `commands` 时启用 `/` 快捷指令与按钮栏。
  */
 export type LoginTerminalHandle = {
-  paste: (text: string) => void
+  paste: (text: string) => boolean
   focus: () => void
 }
 
@@ -67,8 +74,12 @@ export const WsTerminal = forwardRef<
     commands?: SlashCommand[]
     startupCommand?: string
     officialLogin?: boolean
+    onCliBin?: (path: string) => void
+    onConnectionChange?: (connected: boolean) => void
+    canReconnect?: boolean
+    onReconnect?: () => void
     fontSize?: number
-    onLogin?: () => void
+    onLogin?: (result: LoginCommit) => void
     onAuthUrl?: (url: string) => void
   }
 >(function WsTerminal(
@@ -78,6 +89,10 @@ export const WsTerminal = forwardRef<
     commands,
     startupCommand,
     officialLogin,
+    onCliBin,
+    onConnectionChange,
+    canReconnect = true,
+    onReconnect,
     fontSize,
     onLogin,
     onAuthUrl,
@@ -86,11 +101,13 @@ export const WsTerminal = forwardRef<
 ) {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
+  const connectedRef = useRef(false)
   const sendRef = useRef<(data: string) => void>(() => {})
   const pendingMessagesRef = useRef<string[]>([])
   const lineRef = useRef<SlashLine>(SLASH_IDLE)
   const busyRef = useRef(false)
   const commandsRef = useRef<SlashCommand[]>([])
+  const shellPromptRef = useRef(false)
   const [phase, setPhase] = useState<Phase>('connecting')
   const [note, setNote] = useState('')
   const [session, setSession] = useState(0)
@@ -108,8 +125,8 @@ export const WsTerminal = forwardRef<
     const term = termRef.current
     const cmd = withBuiltins(commandsRef.current).find((c) => c.name === name)
     if (!term || !cmd || busyRef.current) return
-    if (term.buffer.active.type !== 'normal') {
-      setNote('全屏程序运行中，退出后再执行快捷指令')
+    if (term.buffer.active.type !== 'normal' || !shellPromptRef.current) {
+      setNote('请先退出前台程序，返回 shell 后再执行快捷指令')
       return
     }
     const line = lineRef.current
@@ -117,6 +134,15 @@ export const WsTerminal = forwardRef<
     const shellLineEmpty = echoed > 0 || line.clean || line.buf !== null
     if (!echoed && line.buf !== null) term.write(eraseEcho(line.buf.length))
     lineRef.current = shellLineEmpty ? SLASH_IDLE : line
+    if (cmd.input) {
+      if (!shellLineEmpty || !shellPromptRef.current) {
+        setNote('请先退出前台程序并清空输入，再执行槽内指令')
+        return
+      }
+      if (echoed) term.write(eraseEcho(echoed))
+      sendRef.current(`${cmd.input}\r`)
+      return
+    }
     if (name === '/clear') {
       if (echoed) term.write(eraseEcho(echoed))
       term.clear()
@@ -129,7 +155,7 @@ export const WsTerminal = forwardRef<
     setRunning(name)
     let rows: string[]
     try {
-      rows = await cmd.run()
+      rows = await cmd.run!()
     } catch (err) {
       rows = [`${RED}✗ ${(err as Error).message}${RESET}`]
     } finally {
@@ -147,18 +173,23 @@ export const WsTerminal = forwardRef<
   onLoginRef.current = onLogin
   const onAuthUrlRef = useRef(onAuthUrl)
   onAuthUrlRef.current = onAuthUrl
-  const seenUrl = useRef('')
-  const urlTail = useRef('')
-  const captureUrl = (raw: string) => {
-    const found = captureLoginAuthUrl(urlTail.current, raw)
-    urlTail.current = found.pending
-    if (!found.url || found.url === seenUrl.current) return
-    seenUrl.current = found.url
-    onAuthUrlRef.current?.(found.url)
-  }
+  const onCliBinRef = useRef(onCliBin)
+  onCliBinRef.current = onCliBin
+  const onConnectionRef = useRef(onConnectionChange)
+  onConnectionRef.current = onConnectionChange
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
+    let seenUrl = ''
+    let urlTail = ''
+    let loginConfirmed = false
+    let framedError = false
+    const decoder = officialLogin ? new TextDecoder() : null
+    const publishUrl = (url: string) => {
+      if (!url || url === seenUrl || loginConfirmed || framedError) return
+      seenUrl = url
+      onAuthUrlRef.current?.(url)
+    }
     const term = new Terminal({
       cursorBlink: true,
       fontSize: fontSize ?? (officialLogin ? 17 : 13),
@@ -169,13 +200,19 @@ export const WsTerminal = forwardRef<
       theme: { background: '#0b0d10' },
       windowOptions: { getWinSizeChars: true, getCellSizePixels: true },
     })
+    shellPromptRef.current = false
+    term.parser.registerOscHandler(133, (data) => {
+      shellPromptRef.current = data === 'A'
+      if (data === 'A') lineRef.current = SLASH_IDLE
+      return true
+    })
     term.parser.registerOscHandler(52, (data) => {
       const payload = data.split(';').pop() || ''
       if (!payload || payload === '?') return true
       try {
         const text = atob(payload)
-        captureUrl(text)
-        void navigator.clipboard?.writeText(text).catch(() => {})
+        if (officialLogin) publishUrl(loginAuthUrl(text))
+        else void navigator.clipboard?.writeText(text).catch(() => {})
       } catch {
         /* CLI copy is best-effort; the URL stays selectable. */
       }
@@ -211,20 +248,24 @@ export const WsTerminal = forwardRef<
     termRef.current = term
     lineRef.current = SLASH_IDLE
     setPhase('connecting')
+    connectedRef.current = false
+    onConnectionRef.current?.(false)
     setNote('')
 
     let ws: WebSocket | null = null
     let disposed = false
     pendingMessagesRef.current = []
     const send = (msg: unknown) => {
+      const input = msg as { t?: string; d?: string }
+      if (input.t === 'd' && /[\r\n]/.test(input.d || ''))
+        shellPromptRef.current = false
       const payload = JSON.stringify(msg)
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(payload)
         return
       }
-      // Keep keystrokes typed while the ticket/exec is opening. Dropping the
-      // first pasted callback makes the terminal look broken even though the
-      // TTY is still healthy.
+      // Do not queue input while the native login session is disconnected.
+      if (officialLogin && input.t === 'd') return
       if (!ws || ws.readyState === WebSocket.CONNECTING) {
         const pending = pendingMessagesRef.current
         if (pending.length < 512) pending.push(payload)
@@ -237,8 +278,10 @@ export const WsTerminal = forwardRef<
       const step = slashInput(
         lineRef.current,
         d,
-        withBuiltins(commandsRef.current).map((c) => c.name),
-        term.buffer.active.type === 'normal'
+        withBuiltins(commandsRef.current)
+          .filter((c) => !c.input || shellPromptRef.current)
+          .map((c) => c.name),
+        term.buffer.active.type === 'normal' && shellPromptRef.current
       )
       lineRef.current = step.line
       for (const a of step.actions) {
@@ -252,12 +295,13 @@ export const WsTerminal = forwardRef<
     )
     const observer = new ResizeObserver(fitTerminal)
     observer.observe(host)
-    api<{ ticket: string }>(ticketPath, {
+    api<{ ticket: string; cli_bin?: string }>(ticketPath, {
       method: 'POST',
       body: officialLogin ? JSON.stringify({ login: true }) : undefined,
     })
-      .then(({ ticket }) => {
+      .then(({ ticket, cli_bin }) => {
         if (disposed) return
+        if (cli_bin) onCliBinRef.current?.(cli_bin)
         const base = new URL(apiBase() || window.location.origin)
         base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
         base.pathname = socketPath
@@ -270,32 +314,68 @@ export const WsTerminal = forwardRef<
         ws = new WebSocket(base.toString())
         ws.binaryType = 'arraybuffer'
         ws.onopen = () => {
+          if (disposed) return
+          connectedRef.current = true
+          onConnectionRef.current?.(true)
           setPhase('open')
           for (const payload of pendingMessagesRef.current) ws?.send(payload)
           pendingMessagesRef.current = []
-          term.focus()
+          if (!officialLogin) term.focus()
           if (startupCommand && !officialLogin)
             send({ t: 'd', d: `${startupCommand}\r` })
         }
         ws.onmessage = (e) => {
+          if (disposed) return
           if (typeof e.data !== 'string') {
             const bytes = new Uint8Array(e.data as ArrayBuffer)
             term.write(bytes)
-            captureUrl(new TextDecoder().decode(bytes))
+            if (decoder) {
+              const found = captureLoginAuthUrl(
+                urlTail,
+                decoder.decode(bytes, { stream: true })
+              )
+              urlTail = found.pending
+              publishUrl(found.url)
+            }
             return
           }
-          const msg = JSON.parse(e.data) as {
-            t: string
-            code?: number | null
-            message?: string
+          const msg = parseTerminalFrame(e.data)
+          if (
+            msg?.t === 'exit' &&
+            !(officialLogin && (framedError || loginConfirmed))
+          ) {
+            setNote(`会话退出（code ${msg.code ?? '—'}）`)
           }
-          if (msg.t === 'exit') setNote(`会话退出（code ${msg.code ?? '—'}）`)
-          if (msg.t === 'login') onLoginRef.current?.()
-          if (msg.t === 'error') setNote(msg.message || '终端错误')
+          if (msg?.t === 'login' && officialLogin && !loginConfirmed) {
+            loginConfirmed = true
+            connectedRef.current = false
+            term.options.disableStdin = true
+            setNote('凭证已同步')
+            onLoginRef.current?.(msg.result)
+          }
+          if (msg?.t === 'error') {
+            framedError = true
+            if (officialLogin) {
+              connectedRef.current = false
+              onConnectionRef.current?.(false)
+              term.options.disableStdin = true
+            }
+            setNote(msg.message)
+          }
         }
-        ws.onclose = () => {
+        ws.onclose = (event) => {
+          if (disposed) return
+          connectedRef.current = false
+          onConnectionRef.current?.(false)
           pendingMessagesRef.current = []
-          if (!disposed) setPhase('closed')
+          if (officialLogin && !framedError && !loginConfirmed) {
+            setNote(
+              (previous) =>
+                previous ||
+                (event.wasClean ? '授权未确认' : '终端连接中断，请重新连接')
+            )
+          }
+          setPhase('closed')
         }
       })
       .catch((err: Error) => {
@@ -306,6 +386,8 @@ export const WsTerminal = forwardRef<
       })
 
     return () => {
+      connectedRef.current = false
+      onConnectionRef.current?.(false)
       disposed = true
       cancelAnimationFrame(initialFit)
       observer.disconnect()
@@ -332,20 +414,27 @@ export const WsTerminal = forwardRef<
     () => ({
       paste(text) {
         const value = String(text || '')
-        if (!value || !termRef.current) return
-        termRef.current.paste(value.endsWith('\n') ? value : `${value}\n`)
-        termRef.current.focus()
+        if (!value || !termRef.current || !connectedRef.current) return false
+        termRef.current.paste(value.replace(/[\r\n]+$/, ''))
+        sendRef.current('\r')
+        if (!officialLogin) termRef.current.focus()
+        return true
       },
       focus() {
         termRef.current?.focus()
       },
     }),
-    []
+    [officialLogin]
   )
   return (
     <div className='flex h-full min-h-0 flex-col gap-2'>
-      <div className='flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground'>
-        <span>
+      <div
+        className={`flex flex-wrap items-center justify-between gap-2 text-xs ${officialLogin ? 'text-zinc-400' : 'text-muted-foreground'}`}
+      >
+        <span
+          role={officialLogin ? 'status' : undefined}
+          className='min-w-0 wrap-anywhere'
+        >
           {phase === 'connecting'
             ? '连接中…'
             : phase === 'open'
@@ -369,21 +458,24 @@ export const WsTerminal = forwardRef<
               {running === c.name ? `${c.name}…` : c.name}
             </Button>
           ))}
-          {phase === 'closed' ? (
+          {phase === 'closed' && canReconnect ? (
             <Button
               size='sm'
               variant='outline'
               className='h-7'
-              onClick={() => setSession((n) => n + 1)}
+              onClick={() => {
+                onReconnect?.()
+                setSession((n) => n + 1)
+              }}
             >
-              重新打开
+              {officialLogin ? '重新连接并生成链接' : '重新打开'}
             </Button>
           ) : null}
         </div>
       </div>
       <div
         ref={hostRef}
-        className='h-full min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border bg-[#0b0d10] p-1'
+        className={`h-full min-h-0 min-w-0 flex-1 overflow-hidden bg-[#0b0d10] p-1 ${officialLogin ? '' : 'rounded-md border'}`}
       />
     </div>
   )

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PoolScheduler, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
+import { PoolScheduler, filterByHostMemory, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
+import { installHostMemoryPressure } from '../../src/lib/cluster/host-memory-pressure.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
@@ -229,6 +230,33 @@ test('healthy sticky binding outranks weighted selection', async (t) => {
   assert.equal(selected.accountId, 'account-2')
   assert.equal(selected.selectionReason, 'sticky')
   selected.release()
+})
+
+test('direct VM selection compares priority before all forms of affinity', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.priority = 10
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+  })
+  const args = {
+    model: 'claude-test',
+    stickyKey: 'conversation-1',
+    deviceVmId: 'vm-02',
+    familyVmId: 'vm-02',
+    allowWait: false,
+  }
+  const selected = await pool.selectAndReserve(args)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+  assert.equal((await pool.peekAccount(args)).vmId, 'vm-01')
+  const fallback = await pool.selectAndReserve({ ...args, excluded: new Set(['vm-01']) })
+  assert.equal(fallback.vmId, 'vm-02')
+  assert.equal(fallback.selectionReason, 'sticky')
+  fallback.release()
 })
 
 test('an exhausted kernel is excluded even when the conversation is pinned to it', async (t) => {
@@ -1312,7 +1340,7 @@ function writeTier(root, id, tier, extras = {}) {
   fs.writeFileSync(file, JSON.stringify(vm))
 }
 
-test('fable skips pro and unknown, lands on max', async (t) => {
+test('fable does not skip a pro slot when a max slot is also up', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1320,7 +1348,7 @@ test('fable skips pro and unknown, lands on max', async (t) => {
   const pool = scheduler(root)
   const selected = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
   assert.equal(selected.ok, true)
-  assert.equal(selected.vmId, 'vm-02')
+  assert.equal(selected.vmId, 'vm-01')
   selected.release()
 })
 
@@ -1348,7 +1376,7 @@ test('fable skips a Max account recently denied that model', async (t) => {
   selected.release()
 })
 
-test('fable with only pro slots returns fable_requires_max', async (t) => {
+test('fable lands on a pro slot', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1357,8 +1385,9 @@ test('fable with only pro slots returns fable_requires_max', async (t) => {
     model: 'claude-fable-5',
     allowWait: false,
   })
-  assert.equal(selected.ok, false)
-  assert.equal(selected.reason, 'fable_requires_max')
+  assert.equal(selected.ok, true)
+  assert.ok(selected.vmId === 'vm-01' || selected.vmId === 'vm-02')
+  selected.release()
 })
 
 test('sonnet still lands on a pro slot', async (t) => {
@@ -1396,7 +1425,7 @@ test('allowed_models whitelist skips other families', async (t) => {
 test('allowed_models prefix matches dated fable ids', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  writeTier(root, 'vm-01', 'pro')
+  writeTier(root, 'vm-01', 'pro', { allowed_models: ['claude-sonnet-5'] })
   writeTier(root, 'vm-02', 'max', { allowed_models: ['claude-fable-5'] })
   const selected = await scheduler(root).selectAndReserve({
     model: 'claude-fable-5-20260801',
@@ -1873,6 +1902,41 @@ test('idle candidate is reserved before waiting when another account releases', 
   assert.equal(third.accountId, second.accountId)
   third.release()
   first.release()
+})
+
+test('a direct waiter takes the highest available priority even when the lower VM wakes it', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const [id, priority] of [
+    ['vm-01', 10],
+    ['vm-02', 1],
+  ]) {
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    Object.assign(vm.policy, { priority, maxConcurrency: 1 })
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+  })
+  applyShortWaits(pool, { sticky: 400, fallback: 400 })
+  const args = { model: 'claude-test' }
+  const high = await pool.selectAndReserve({ ...args, allowWait: false })
+  const low = await pool.selectAndReserve({ ...args, allowWait: false })
+  assert.equal(high.vmId, 'vm-01')
+  assert.equal(low.vmId, 'vm-02')
+  const pending = pool.selectAndReserve({ ...args, stickyKey: 'conversation-1' })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(pool.snapshot().waiters.total, 1)
+  const notify = pool.notifyCapacity.bind(pool)
+  pool.notifyCapacity = () => {}
+  low.release()
+  high.release()
+  pool.notifyCapacity = notify
+  notify(low.accountId)
+  const selected = await pending
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
 })
 
 test('account concurrency is not clamped to ready_slots', async (t) => {
@@ -3075,4 +3139,94 @@ test('a resting slot that cannot serve the model does not promise a Retry-After'
   const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(selected.ok, false)
   assert.equal(selected.retry_after_ms, null)
+})
+
+// ---- host memory pressure admission ----
+
+function hostLevels(t, levels) {
+  installHostMemoryPressure({ levelForVm: (vm) => levels[vm.id] || 'ok' })
+  t.after(() => installHostMemoryPressure(null))
+}
+
+test('filterByHostMemory prefers machines with room and keeps the sticky VM', () => {
+  const c = (vmId, hostPressure) => ({ vmId, hostPressure })
+  const ids = (list) => list.map((x) => x.vmId)
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'ok')])), ['b'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'critical')])), ['a'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'critical'), c('b', 'critical')])), [])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'critical'), c('b', 'ok')], 'a')), ['a', 'b'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'tight')], 'a')), ['a', 'b'])
+})
+
+test('direct selection avoids a tight machine while another has room', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-01': 'tight' })
+  const pool = scheduler(root)
+  for (let i = 0; i < 4; i++) {
+    const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+    assert.equal(selected.accountId, 'account-2')
+    selected.release()
+  }
+})
+
+test('direct selection still uses tight machines when none has room, never critical ones', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const levels = { 'vm-01': 'tight', 'vm-02': 'critical' }
+  hostLevels(t, levels)
+  const pool = scheduler(root)
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.accountId, 'account-1')
+  selected.release()
+  levels['vm-01'] = 'critical'
+  const blocked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(blocked.ok, false)
+})
+
+test('a continuing conversation keeps its VM on a critical machine', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-02': 'critical' })
+  const pool = scheduler(root, { stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) } })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conversation-1', allowWait: false })
+  assert.equal(selected.accountId, 'account-2')
+  assert.equal(selected.selectionReason, 'sticky')
+  selected.release()
+})
+
+test('seat selection opens new conversations on machines with room first', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const levels = { 'vm-01': 'tight' }
+  hostLevels(t, levels)
+  const pool = scheduler(root)
+  const first = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-1', allowWait: false })
+  assert.equal(first.ok, true)
+  assert.equal(first.vmId, 'vm-02')
+  first.release()
+  levels['vm-02'] = 'critical'
+  const second = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-2', allowWait: false })
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, 'vm-01', 'tight is used when nothing has room')
+  second.release()
+  levels['vm-01'] = 'critical'
+  const third = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-3', allowWait: false })
+  assert.equal(third.ok, false)
+})
+
+test('seat selection keeps a sticky conversation on its critical machine', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-01': 'critical', 'vm-02': 'critical' })
+  const pool = scheduler(root, { stickyRouter: { resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }) } })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:hm-sticky',
+    stickyKey: 'conversation-hm',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
 })

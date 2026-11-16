@@ -10,6 +10,7 @@ import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
+import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import path from 'node:path'
@@ -50,13 +51,13 @@ import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
-import { inferClaudeTier } from '../pool/claude-tier.mjs'
+import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
-import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
+import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -688,11 +689,12 @@ export async function buildDashboard({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    snap.accounts || [],
   )
 
   let dbTotals = null
@@ -819,11 +821,12 @@ export async function buildVmList({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    accounts,
   )
   return ok({
     items: vms,
@@ -886,6 +889,9 @@ export async function buildVmDetail({
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
   const gpt = isCodexVm(vm)
   applyCostFields(summary, cost, { coveredSince: billing?.log_coverage_start })
+  if (billing?.lifetime_accounts) {
+    applyLifetimeUsage(summary, new Map(billing.lifetime_accounts.map((row) => [row.account_id, row])))
+  }
   const detail = buildAccountBilling(cost, billing, {
     vmId: summary.id,
     accountId: acc?.account_id || summary.account_uuid,
@@ -1069,11 +1075,12 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transport, now } = {}) {
+export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, transport, now } = {}) {
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
     idempotencyKey,
+    card,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
   })
@@ -1233,6 +1240,10 @@ export async function buildProbeOne({
       })
     } catch {}
   }
+  // A failed/missing profile must not let usage replace an already verified plan.
+  const profile = [result, acc?.unified, vm.claude, vm].find(
+    (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
+  )
   if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
   if (result.subscription_type) {
     persistVmSubscription(cfg.paths.project, id, result, {
@@ -1254,10 +1265,14 @@ export async function buildProbeOne({
     qAfter.status_5h ||
     qAfter.utilization_7d != null ||
     !!(passive?.five_hour || passive?.seven_day)
-  const tier = inferClaudeTier(
+  const tierRecord = profile || after?.unified || {}
+  const rateLimitTier = result.rate_limit_tier || vm.claude?.rate_limit_tier || vm.rate_limit_tier || null
+  const inferredTier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || null,
+      account_tier: tierRecord.account_tier || null,
+      account_tier_source: tierRecord.account_tier_source || null,
+      rate_limit_tier: rateLimitTier,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1267,10 +1282,23 @@ export async function buildProbeOne({
     qAfter,
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
-  if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
-  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
+  const tier =
+    profile?.account_tier ||
+    (completeUsage && ['pro', 'max'].includes(result.account_tier)
+      ? guardUsageTier(result.account_tier, rateLimitTier)
+      : inferredTier)
+  if (profile) {
+    accountQuota.setAccountTier(accountId, profile.account_tier, { source: 'profile' })
+    persistAccountTier(cfg.paths.project, id, profile.account_tier, { source: 'profile' })
+  } else if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
+    const usageTier = guardUsageTier(result.account_tier, rateLimitTier)
+    accountQuota.setAccountTier(accountId, usageTier, { source: 'usage' })
+    persistAccountTier(cfg.paths.project, id, usageTier, { source: 'usage' })
+  } else if (
+    completeUsage &&
+    (result.usage_has_fable != null || result.seven_day_oi) &&
+    (tier === 'pro' || tier === 'max')
+  ) {
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
@@ -1347,7 +1375,7 @@ export async function buildProbeOne({
     cred_status: credStatusFromAvailability(availability),
     fable: result.usage_scope_missing ? q.fable || null : after?.unified?.fable || result.fable || q.fable || null,
     fable_probed: includeFable && !skipHop && !result.usage_scope_missing,
-    account_tier: completeUsage ? result.account_tier || tier : tier,
+    account_tier: tier,
     probed_at: result.probed_at,
     ok: !!(result.ok || passive || (rateLimited && cachedWindow)),
     rate_limited: rateLimited,
@@ -1577,11 +1605,12 @@ export async function snapshotAccountPool({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    accounts,
   )
   let today = null
   try {
@@ -1668,6 +1697,7 @@ export function quotaFromAccount(acc, quotaConfig) {
     last_probe_check: u.last_probe_check || null,
     probe_source: u.source || acc?.last_probe?.source || null,
     account_tier: u.account_tier || null,
+    account_tier_source: u.account_tier_source || null,
     usage_has_fable: u.usage_has_fable ?? null,
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
@@ -1837,11 +1867,10 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     vmQuotaConfig,
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
-  const scheduleLevel = resolveCredentialScheduleLevel({
-    manualLevel: v.schedule_level_manual,
-    unified: acc?.unified || {},
-  })
   const isCodex = isCodexVm(v)
+  const scheduleLevel = isCodex
+    ? codexScheduleLevel(v)
+    : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
   // OpenAI quota mirrors are observations; admission uses the current raw windows and policy.
   if (isCodex && isQuotaWindowReason(v.temp_unschedulable_reason)) {
     v = { ...v, temp_unschedulable_until: null, temp_unschedulable_reason: null }
@@ -1862,7 +1891,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     : inferClaudeTier(
         {
           has_token: hasToken,
-          account_tier: v.account_tier || q.account_tier,
+          account_tier: v.account_tier,
+          account_tier_source: v.account_tier_source,
+          rate_limit_tier: v.rate_limit_tier,
           fable: q.fable,
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
@@ -2022,6 +2053,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     has_token: hasToken,
     expires_at: expiresAt,
     oauth_source: v.oauth_source || null,
+    oauth_registration: v.oauth_registration || null,
     credential_mode: v.credential_mode || v.claude?.mode || 'oauth',
     auth_scheme: v.auth_scheme || v.claude?.auth_scheme || null,
     can_claude_reset: isCodex ? false : v.can_claude_reset === true,
@@ -2110,6 +2142,15 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
+    account_tier_source: isCodex
+      ? null
+      : [v, q].some(
+            (record) => record.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
+          )
+        ? 'profile'
+        : v.account_tier_source === 'usage' || q.account_tier_source === 'usage'
+          ? 'usage'
+          : null,
     subscription_type: isCodex ? null : v.subscription_type || null,
     rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
@@ -2440,13 +2481,21 @@ function panelBillingStats(requestLog, accountQuota, vms) {
   return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
 }
 
-function stampVmBilling(vms, billing) {
+function applyLifetimeUsage(vm, index) {
+  const key = vm.has_token ? (isCodexVm(vm) ? openaiUsageAccountId(vm.org_uuid) : vm.account_uuid) : null
+  const row = key ? index.get(key) : null
+  vm.lifetime_usage = { cost: Number(row?.total_cost || 0), tokens: Number(row?.total_tokens || 0) }
+}
+
+function stampVmBilling(vms, billing, accounts) {
   if (!billing) return null
   const index = indexBillingAccounts(billing)
+  const lifetime = billing.lifetime_accounts && new Map(billing.lifetime_accounts.map((row) => [row.account_id, row]))
   for (const vm of vms || []) {
     applyCostFields(vm, lookupBilling(index, vm), { coveredSince: billing.log_coverage_start })
+    if (lifetime) applyLifetimeUsage(vm, lifetime)
   }
-  return billing
+  return attachBillingMeta(billing, accounts)
 }
 
 function cacheCostOf(row) {

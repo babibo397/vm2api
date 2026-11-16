@@ -38,7 +38,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -75,7 +75,6 @@ import { clientIp } from '../pool/sticky-router.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
-  'originator',
   'openai-beta',
   'session-id',
   'thread-id',
@@ -185,7 +184,10 @@ export function isRetryableSameCodexAccount(
   if (status === 408) return true
   if (status === 500 || status === 502 || status === 503 || status === 504) {
     return (
-      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+      code === '' ||
+      /server_error|provider_error|upstream_error|overloaded_error|internal_error|server_is_overloaded|transport/i.test(
+        code,
+      )
     )
   }
   return false
@@ -775,6 +777,7 @@ export async function handleCodexProtocol({
         hops += 1
         logBag.vm_id = vm.id
         logBag.attempt_count = hops
+        logBag.usage_account_id = openaiUsageAccountId(searchCredentials(projectRoot, vm).accountId)
         const chunks = []
         const nameSseEvent = createResponsesSseEventNamer()
         let responseServiceTier = null
@@ -826,7 +829,7 @@ export async function handleCodexProtocol({
                 headers: outboundHeaders,
                 stream: true,
                 session,
-                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+                options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
               },
             },
             onReasoningFallback: ({ body: retryBody }) => {
@@ -1176,7 +1179,12 @@ async function postCodexJson({
     Object.assign(headers, extraHeaders)
     try {
       const res = await doFetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
-      return { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
+      return {
+        status: Number(res?.status) || 0,
+        text: await res.text(),
+        headers: plainHeaders(res?.headers),
+        accountId: creds.accountId,
+      }
     } catch (e) {
       return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
     }
@@ -1244,6 +1252,7 @@ export async function handleCodexSearch({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }
@@ -1286,6 +1295,7 @@ export async function handleCodexSearch({
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
         })
+        logBag.usage_account_id = openaiUsageAccountId(last.accountId)
         logBag.upstream_status = last.status || null
         ingestCodexHop(projectRoot, vm.id, {
           ok: last.status >= 200 && last.status < 300,
@@ -1403,6 +1413,7 @@ export async function handleCodexImages({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }
@@ -1450,6 +1461,7 @@ export async function handleCodexImages({
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
         })
+        logBag.usage_account_id = openaiUsageAccountId(last.accountId)
         logBag.upstream_status = last.status || null
         ingestCodexHop(projectRoot, vm.id, {
           ok: last.status >= 200 && last.status < 300,

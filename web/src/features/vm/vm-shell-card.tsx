@@ -127,7 +127,21 @@ export function VmShellCard({
   const commands = useMemo<SlashCommand[]>(
     () => [
       {
+        name: '/sync',
+        desc: '将面板凭证同步给 VM 原生 CC',
+        run: async () => {
+          await postVm(id, '/credentials/sync')
+          onChanged()
+          return ['  凭证已同步；新启动的 Claude Code 将使用当前凭证']
+        },
+      },
+      {
         name: '/usage',
+        desc: '打开本槽 CRAG 原生 Claude Code 的用量',
+        input: 'usage',
+      },
+      {
+        name: '/probe',
         desc: '查看用量（同「探测」）',
         run: async () => {
           const probe = await postVm<UsageProbe>(id, '/probe')
@@ -193,6 +207,7 @@ export function VmShellCard({
         {open ? (
           <div className='h-[420px]'>
             <WsTerminal
+              key={`${id}:${vm.resolved_dataplane}:${vm.resolved_crag_kernel_version}`}
               ticketPath={`/api/panel/vms/${encodeURIComponent(id)}/shell-ticket`}
               socketPath={`/api/panel/vms/${encodeURIComponent(id)}/shell`}
               commands={commands}
@@ -205,8 +220,9 @@ export function VmShellCard({
             </Button>
             <span className='text-xs text-muted-foreground'>
               进入 <span className='font-mono'>{container || id}</span>{' '}
-              容器，启动时打印系统特征；空行输入{' '}
-              <span className='font-mono'>/help</span> 查看快捷指令
+              容器，终端使用 CRAG 包内原生 CC。凭证自动同步，也可输入 /sync
+              手动修复链接。空行输入 <span className='font-mono'>/help</span>{' '}
+              查看快捷指令
             </span>
           </div>
         )}
