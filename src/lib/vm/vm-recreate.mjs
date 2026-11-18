@@ -27,6 +27,7 @@ import {
   verifyCragV2Tree,
 } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
+import { regenerateMachineIdentity } from './machine-spec.mjs'
 import { slotHost } from './slot-host.mjs'
 import {
   applyGeneratedFingerprint,
@@ -126,9 +127,11 @@ export function preflightFreshClaudeKernels(projectRoot, vm) {
 }
 
 export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {
-  const written = writeSlotSeedFiles(projectRoot, vm)
+  const host = slotHost(vm)
+  const crag = resolveKernelDataplane(vm, routing) === 'crag'
+  const written = writeSlotSeedFiles(projectRoot, vm, null, { cragNativeTelemetry: crag && !host.native })
   // Cluster payloads go in slot-bin, not the control plane's .kin home.
-  if (!slotHost(vm).bakedKernel) {
+  if (!host.bakedKernel) {
     if (preinstallBoth) {
       const wrap = materializeWrapCli(projectRoot, vm)
       requireKernelResult(wrap)
@@ -139,7 +142,7 @@ export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = fa
       // Wrap already stages the encrypted CRAG package for local KVM slots.
       if (!isKvmRuntime(vm)) requireKernelResult(materializeCragV2(projectRoot, vm, { select: false }))
     } else {
-      const required = resolveKernelDataplane(vm, routing) === 'crag' || (isKvmRuntime(vm) && !isCodexVm(vm))
+      const required = crag || (isKvmRuntime(vm) && !isCodexVm(vm))
       try {
         const laid = materializeResolvedKernel(projectRoot, vm, { routing })
         if (required) requireKernelResult(laid)
@@ -159,6 +162,15 @@ function keptAccount(prev) {
     for (const key of ['access_token', 'refresh_token', 'id_token']) delete codex[key]
   }
   return { claude, codex }
+}
+
+function recreatedMachine(prev, keep) {
+  const machine = prev?.machine && typeof prev.machine === 'object' ? prev.machine : null
+  const kvm = prev?.runtime?.type === 'kvm'
+  if (keep && machine && (!kvm || (machine.mac && machine.disk_serial))) return { machine: { ...machine } }
+  // traits, or a KVM record that never stored its identity: the container is already gone, so draw one.
+  if (machine || kvm) return { machine: regenerateMachineIdentity(machine) }
+  return {}
 }
 
 export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}) {
@@ -220,6 +232,8 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
     runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
+    // Sizing survives a reset; traits draws a new MAC / SMBIOS / disk serial. KVM cannot boot without them.
+    ...recreatedMachine(prev, keep),
     proxy_required: prev.proxy_required,
     ...(prev.inference_engine ? { inference_engine: prev.inference_engine } : {}),
     ...(prev.dataplane ? { dataplane: prev.dataplane } : {}),

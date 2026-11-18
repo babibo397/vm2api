@@ -41,6 +41,7 @@ import { cragHostStatusQueryOptions } from '@/features/vm/queries'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
+  cancelKernelInstall,
   kernelCatalogQueryOptions,
   kernelVersionsQueryOptions,
   pullKernelRelease,
@@ -58,6 +59,7 @@ const LICENSE_LABELS: Record<CragLicenseStatus['status'], string> = {
   invalid: '授权无效',
   unconfigured: '未配置',
 }
+
 const VM_STATUS: Record<string, string> = {
   running: '运行中',
   stopped: '已停用',
@@ -160,12 +162,9 @@ export function WrapSamplePage() {
     ? Object.values(job.results).filter((item) => item.ok).length
     : 0
   const confirmedCrag = confirm?.find((target) => target.kernel === 'crag')
-  const confirmedCragTag = confirmedCrag?.payload_tag
+  const confirmedCragTag =
+    confirmedCrag?.payload_tag ?? confirmedCrag?.expected_tag
   const confirmedCragLabel = cragReleaseLabel(confirmedCragTag)
-  const missingLicenses = (confirm || []).filter(
-    (target) =>
-      target.kernel === 'crag' && !catalog.data?.licenses[target.id]?.valid
-  )
 
   function requestInstall(targets: KernelTarget[]) {
     if (!canEdit || busy || !targets.length) return
@@ -201,24 +200,27 @@ export function WrapSamplePage() {
       )
       return
     }
-    const unlicensed = targets.find(
-      (target) =>
-        target.kernel === 'crag' && !catalog.data?.licenses[target.id]?.valid
-    )
-    if (unlicensed && targets.length === 1) {
-      const vm = vmById.get(unlicensed.id)
-      toast.error(`${vm?.name || unlicensed.id} 需要 CRAG 授权`)
-      if (vm) setLicenseVm(vm)
-      return
-    }
-    setConfirm(
-      targets.map((target) => {
-        const product = products.get(target.kernel)
-        return product?.payload_tag
-          ? { ...target, payload_tag: product.payload_tag }
-          : { ...target, expected_tag: product?.release_tag }
+    const pinned = targets.map((target): KernelTarget => {
+      const product = products.get(target.kernel)
+      return {
+        ...target,
+        ...(product?.payload_tag
+          ? { payload_tag: product.payload_tag }
+          : { expected_tag: product?.release_tag }),
+      }
+    })
+    setConfirm(pinned)
+  }
+
+  async function forceCancel(id: string) {
+    try {
+      await cancelKernelInstall(id)
+      toast.warning('已强制取消该虚拟机的安装', {
+        description: '已停止的槽位保持维护状态，请检查后重装或手动启动。',
       })
-    )
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '取消失败')
+    }
   }
 
   async function runInstall(targets: KernelTarget[]) {
@@ -231,6 +233,7 @@ export function WrapSamplePage() {
       results: {},
     })
     let failures = 0
+    let reclaimPending = 0
     try {
       for (let index = 0; index < targets.length; index++) {
         const target = targets[index]
@@ -269,6 +272,7 @@ export function WrapSamplePage() {
           }
         }
         if (!result.ok) failures++
+        else if (result.reclaim_pending) reclaimPending++
         setJob((previous) =>
           previous
             ? {
@@ -282,6 +286,14 @@ export function WrapSamplePage() {
       if (failures)
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
+        )
+      else if (reclaimPending)
+        toast.warning(
+          `${targets.length} 台内核已安装并重启，${reclaimPending} 个 CRAG 绑定待回收`,
+          {
+            description:
+              '启用槽位回收后，请重装 cli-node 完成回收，额度以服务端确认为准。',
+          }
         )
       else toast.success(`${targets.length} 台内核已安装并重启，调度状态已更新`)
     } finally {
@@ -573,6 +585,15 @@ export function WrapSamplePage() {
                       ? `正在安装 ${Math.min(job.completed + (job.activeId ? 1 : 0), job.total)}/${job.total}`
                       : `已完成：${succeededCount} 台成功${failedCount ? `，${failedCount} 台失败` : ''}`}
                   </span>
+                  {installing && job.activeId ? (
+                    <Button
+                      variant='outline'
+                      size='sm'
+                      onClick={() => void forceCancel(job.activeId!)}
+                    >
+                      强制取消
+                    </Button>
+                  ) : null}
                   {!installing ? (
                     <Button
                       variant='ghost'
@@ -722,7 +743,7 @@ export function WrapSamplePage() {
                               )}
                               <span>
                                 {result.ok
-                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}`
+                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}${result.reclaim_pending ? '；CRAG 绑定待回收' : ''}`
                                   : `${result.error || '安装失败'}${result.stopped ? '；服务已停用' : ''}`}
                               </span>
                             </p>
@@ -869,25 +890,29 @@ export function WrapSamplePage() {
         }
         desc={
           <>
-            按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。
+            按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据和工作数据不变。
             {confirmedCrag ? (
-              <p className='mt-2 wrap-anywhere'>
-                CRAG 当前缓存标签：{confirmedCragTag || '未记录'}
-                {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
-                  ? `（${confirmedCragLabel}）`
-                  : null}
-              </p>
+              <>
+                <p className='mt-2'>
+                  CRAG 会在停机前校验授权和运行名额。校验未通过的 VM 不会停机。
+                </p>
+                <p className='mt-2 wrap-anywhere'>
+                  CRAG 安装版本：{confirmedCragTag || '未记录'}
+                  {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
+                    ? `（${confirmedCragLabel}）`
+                    : null}
+                </p>
+              </>
             ) : null}
           </>
         }
         confirmText='重装并重启'
         cancelBtnText='取消'
-        disabled={!canEdit || busy || missingLicenses.length > 0}
+        disabled={!canEdit || busy}
         destructive
         className='motion-reduce:animate-none [&_button]:min-h-11'
         handleConfirm={() => {
-          if (confirm && canEdit && !busy && !missingLicenses.length)
-            void runInstall(confirm)
+          if (confirm && canEdit && !busy) void runInstall(confirm)
         }}
       >
         <ul className='max-h-56 space-y-2 overflow-y-auto rounded-lg bg-muted/50 p-3 text-sm'>
@@ -902,20 +927,10 @@ export function WrapSamplePage() {
               <span className='shrink-0 font-medium'>
                 {KERNEL_NAMES[target.kernel]}
                 {target.expected_tag ? ` ${target.expected_tag}` : ''}
-                {target.kernel === 'crag' &&
-                !catalog.data?.licenses[target.id]?.valid
-                  ? ' · 待授权'
-                  : ''}
               </span>
             </li>
           ))}
         </ul>
-        {missingLicenses.length ? (
-          <p role='alert' className='text-sm text-destructive'>
-            {missingLicenses.length} 台 CRAG 尚未授权，请先在对应 VM
-            行激活。未执行任何重装或停用。
-          </p>
-        ) : null}
       </ConfirmDialog>
       {licenseVm ? (
         <KernelLicenseDialog

@@ -42,6 +42,8 @@ export type KernelInstallItem = KernelTarget & {
   ok: boolean
   stopped: boolean
   restarted?: boolean
+  rolled_back?: boolean
+  reclaim_pending?: boolean
   schedulable?: boolean
   status?: string
   version?: string | null
@@ -94,6 +96,14 @@ export function installKernelTargets(targets: KernelTarget[]) {
     method: 'POST',
     body: JSON.stringify({ targets }),
   })
+}
+
+/** Abandons one VM's in-flight install and frees the kernel cache for other VMs. */
+export function cancelKernelInstall(id: string) {
+  return api<{ id: string; kernel: string; phase: string }>(
+    '/api/panel/kernels/install/cancel',
+    { method: 'POST', body: JSON.stringify({ id }) }
+  )
 }
 
 // Fleet actions outside /wrap still consume the existing runtime-sync report.

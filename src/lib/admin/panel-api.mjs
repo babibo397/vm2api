@@ -6,6 +6,7 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pressure.mjs'
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
@@ -924,7 +925,9 @@ export async function buildVmDetail({
       }
     }
   }
-  const processStatus = gpt ? null : await slotProcessStatus({ projectRoot: cfg.paths.project, vm })
+  const processStatus = gpt
+    ? null
+    : await slotProcessStatus({ projectRoot: cfg.paths.project, vm, routing: routingConfig })
   const activeEngine = gpt ? null : rustHealth?.reachable ? 'rust' : null
   return ok({
     vm: summary,
@@ -1644,7 +1647,19 @@ function hostStats() {
     heap_total: mem.heapTotal,
     uptime: os.uptime(),
     proc_uptime: process.uptime(),
+    memory_pressure: hostMemoryPressureOf(LOCAL_HOST_KEY),
   }
+}
+
+/** The 'usage credits required' Fable marker while its routing block lasts. */
+function activeFableCreditsRequired(unified, now = Date.now()) {
+  const mark = unified?.fable_credits_required
+  if (!mark) return null
+  const until = Date.parse(mark.until || '')
+  if (!Number.isFinite(until) || until <= now) return null
+  const deniedUntil = Number(unified.model_denied_until?.[mark.model]) || 0
+  if (deniedUntil <= now) return null
+  return { model: mark.model || null, at: mark.at || null, until: mark.until }
 }
 
 export function quotaFromAccount(acc, quotaConfig) {
@@ -1699,6 +1714,7 @@ export function quotaFromAccount(acc, quotaConfig) {
     account_tier: u.account_tier || null,
     account_tier_source: u.account_tier_source || null,
     usage_has_fable: u.usage_has_fable ?? null,
+    fable_credits_required: activeFableCreditsRequired(u),
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
   const split = publicWeeklySplit(
@@ -2154,6 +2170,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     subscription_type: isCodex ? null : v.subscription_type || null,
     rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
+    fable_credits_required: isCodex ? null : q.fable_credits_required || null,
+    // pool.fable_requires_max: this slot never gets Fable because it is not Max.
+    fable_requires_max: !isCodex && extras.routingConfig?.pool?.fable_requires_max === true && tierKey !== 'max',
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,
@@ -2556,6 +2575,7 @@ function applyCostFields(target, cost, { coveredSince = null } = {}) {
   target.window_7d_success = cost?.window_7d_success || 0
   target.window_7d_errors = cost?.window_7d_errors || 0
   target.window_7d_tokens = cost?.window_7d_tokens || 0
+  target.health_24h = Array.isArray(cost?.health_24h) ? cost.health_24h : null
   Object.assign(target, windowEstimates(target, cost, coveredSince, isCodexVm(target)))
 }
 

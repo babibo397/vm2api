@@ -1,18 +1,19 @@
 import type { Vm } from '@/types/panel-vm'
 import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
+import GeminiColor from '@lobehub/icons/es/Gemini/components/Color'
 import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { clipLabel, isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
 
-function PlatformMark({ vm }: { vm: Vm }) {
+export function PlatformMark({ vm }: { vm: Vm }) {
   const gpt = isCodexVm(vm)
-  const Icon = gpt ? OpenAI : ClaudeColor
-  const label = gpt ? 'openai' : 'anthropic'
+  const Icon = vm.gemini ? GeminiColor : gpt ? OpenAI : ClaudeColor
+  const label = vm.gemini ? 'Gemini' : gpt ? 'openai' : 'anthropic'
   return (
     <span
       className='inline-flex size-3.5 shrink-0 items-center justify-center'
@@ -38,12 +39,15 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           className='truncate font-mono font-medium'
           title={vm.name || vm.id}
         >
-          {vm.id}
+          {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
         </span>
       </div>
       <div className='flex min-w-0 items-center gap-1.5'>
-        <div className='truncate text-xs font-semibold' title={email}>
-          {email || '未绑定邮箱'}
+        <div
+          className='truncate text-xs font-semibold'
+          title={email || undefined}
+        >
+          {email ? clipLabel(email) : '未绑定邮箱'}
         </div>
         <ActiveVmBadge vm={vm} />
       </div>
@@ -51,10 +55,14 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         <span
           className={cn('rounded px-1 font-semibold', tierVisual(vm).badge)}
         >
-          {claudeTier(vm).label}
+          {vm.gemini
+            ? vm.gemini.account?.plan || 'Gemini'
+            : claudeTier(vm).label}
         </span>
         <span aria-hidden='true'>|</span>
-        <span>{vm.runtime_type === 'kvm' ? 'kvm' : 'vm'}</span>
+        <span>
+          {vm.gemini ? '宿主机' : vm.runtime_type === 'kvm' ? 'kvm' : 'vm'}
+        </span>
         <span aria-hidden='true'>|</span>
         <span>{registration === 'none' ? '无凭证' : registration}</span>
         <VmRentedMark vm={vm} />
@@ -69,7 +77,7 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           )}
           title='当前内核'
         >
-          {crag ? 'crag' : '默认'}
+          {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
         </span>
         <span className='truncate' title={node}>
           {node}

@@ -1,24 +1,54 @@
-import type { ReactNode } from 'react'
-import type { Vm } from '@/types/panel-vm'
+import type { ComponentProps, ReactNode } from 'react'
+import type { CragLicenseStatus, Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { toast } from 'sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CragHostStatus } from '@/features/vm/queries'
 import { WrapSamplePage } from './index'
-import type { KernelInstallation } from './queries'
+import { installKernelTargets, type KernelInstallation } from './queries'
+
+type ConfirmProps = ComponentProps<
+  typeof import('@/components/confirm-dialog').ConfirmDialog
+>
+type ButtonProps = ComponentProps<
+  typeof import('@/components/ui/button').Button
+>
 
 const state = vi.hoisted(() => ({
   vms: [] as Vm[],
   installations: {} as Record<string, KernelInstallation>,
+  licenses: {} as Record<string, CragLicenseStatus>,
+  installLicenses: undefined as Record<string, CragLicenseStatus> | undefined,
   role: 'admin',
   host: undefined as CragHostStatus | undefined,
   hostError: false,
   hostEnabled: false,
   hostInterval: undefined as number | false | undefined,
+  values: [] as unknown[],
+  cursor: 0,
+  buttons: [] as ButtonProps[],
+  confirm: undefined as ConfirmProps | undefined,
+  invalidateQueries: vi.fn(),
 }))
 
+vi.mock('react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react')>()),
+  useState: (initial: unknown) => {
+    const index = state.cursor++
+    if (index >= state.values.length)
+      state.values[index] = typeof initial === 'function' ? initial() : initial
+    return [
+      state.values[index],
+      (next: unknown) => {
+        state.values[index] =
+          typeof next === 'function' ? next(state.values[index]) : next
+      },
+    ]
+  },
+}))
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
-  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+  useQueryClient: () => ({ invalidateQueries: state.invalidateQueries }),
   useMutation: () => ({ isPending: false }),
   useQuery: ({
     queryKey,
@@ -43,9 +73,17 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
       data: queryKey.includes('kernels')
         ? {
             kernels: [
-              { id: 'crag', paid: true, ready: true, version: '3.0.8' },
+              {
+                id: 'crag',
+                paid: true,
+                ready: true,
+                version: '3.0.8',
+                payload_tag: 'payload-2026.11.16-crag-3.0.8',
+              },
+              { id: 'cli-node', paid: false, ready: true, version: '1.4.131' },
             ],
-            licenses: {},
+            licenses: state.licenses,
+            install_licenses: state.installLicenses,
             installations: state.installations,
           }
         : queryKey.includes('dashboard')
@@ -63,9 +101,34 @@ vi.mock('@/components/page-header', () => ({
     <main>{children}</main>
   ),
 }))
-vi.mock('@/components/confirm-dialog', () => ({ ConfirmDialog: () => null }))
+vi.mock('@/components/confirm-dialog', () => ({
+  ConfirmDialog: (props: ConfirmProps) => {
+    state.confirm = props
+    return props.open ? <div>{props.desc}</div> : null
+  },
+}))
+vi.mock('@/components/ui/button', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui/button')>()
+  return {
+    ...actual,
+    Button: (props: ButtonProps) => {
+      state.buttons.push(props)
+      return <actual.Button {...props} />
+    },
+  }
+})
+vi.mock('./queries', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./queries')>()),
+  installKernelTargets: vi.fn(),
+}))
+vi.mock('sonner', () => ({
+  toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
+}))
 
 function render(vm: Partial<Vm> = {}) {
+  state.cursor = 0
+  state.buttons.length = 0
+  state.confirm = undefined
   state.vms = [
     { id: 'vm-old', resolved_dataplane: 'wrap', runtime_type: 'kvm', ...vm },
   ]
@@ -73,13 +136,161 @@ function render(vm: Partial<Vm> = {}) {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks()
   state.installations = {}
+  state.licenses = {}
+  state.installLicenses = undefined
   state.role = 'admin'
   state.host = undefined
   state.hostError = false
   state.hostEnabled = false
   state.hostInterval = undefined
+  state.values = []
+  state.cursor = 0
+  state.buttons = []
+  state.confirm = undefined
+  state.invalidateQueries.mockReset()
+  vi.mocked(installKernelTargets).mockReset()
+  vi.mocked(installKernelTargets).mockImplementation(async (targets) => ({
+    ok: true,
+    total: targets.length,
+    ok_count: targets.length,
+    failed_count: 0,
+    items: targets.map((target) => ({
+      ...target,
+      ok: true,
+      stopped: true,
+      restarted: true,
+    })),
+  }))
 })
+
+async function reinstallCrag(vm: Partial<Vm>) {
+  const selected: Partial<Vm> = {
+    ...vm,
+    resolved_dataplane: 'crag',
+    resolved_crag_kernel_version: 'v2',
+  }
+  render(selected)
+  const button = state.buttons.find(
+    (entry) => entry['aria-label'] === '重装 vm-old 并重启'
+  )
+  expect(button).toBeDefined()
+  expect(button?.disabled).toBe(false)
+  button?.onClick?.({} as Parameters<NonNullable<ButtonProps['onClick']>>[0])
+  render(selected)
+  expect(state.confirm?.open).toBe(true)
+  expect(state.confirm?.handleConfirm).toBeTypeOf('function')
+  state.confirm?.handleConfirm?.()
+  await vi.waitFor(() =>
+    expect(state.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['panel', 'vms'],
+    })
+  )
+}
+
+describe('KVM reinstall confirmation', () => {
+  it.each([
+    { runtime_type: 'kvm' },
+    { runtime: { type: 'kvm' } },
+    { runtime: { type: 'qemu' } },
+    { runtime: { type: 'libvirt' } },
+  ] satisfies Partial<Vm>[])(
+    'pins the confirmed payload for local runtime %j',
+    async (vm) => {
+      await reinstallCrag(vm)
+      expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+        {
+          id: 'vm-old',
+          kernel: 'crag',
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
+        },
+      ])
+    }
+  )
+
+  it.each(['docker', 'kvm', 'qemu', 'libvirt'])(
+    'pins the confirmed payload for remote %s slots',
+    async (type) => {
+      await reinstallCrag({ runtime: { type }, node_id: 'node-remote' })
+      expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+        {
+          id: 'vm-old',
+          kernel: 'crag',
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
+        },
+      ])
+    }
+  )
+})
+
+it('shows deferred CRAG reclamation after a cli-node install and refreshes the host count', async () => {
+  vi.mocked(installKernelTargets).mockImplementationOnce(async (targets) => ({
+    ok: true,
+    total: targets.length,
+    ok_count: targets.length,
+    failed_count: 0,
+    items: targets.map((target) => ({
+      ...target,
+      ok: true,
+      stopped: true,
+      restarted: true,
+      reclaim_pending: true,
+    })),
+  }))
+  const vm = { id: 'slot-a', resolved_dataplane: 'crag' } as const
+  render(vm)
+  state.values[2] = { 'slot-a': 'cli-node' }
+  render(vm)
+  const button = state.buttons.find(
+    (entry) => entry['aria-label'] === '安装 slot-a 并重启'
+  )
+  expect(button?.disabled).toBe(false)
+  button?.onClick?.({} as Parameters<NonNullable<ButtonProps['onClick']>>[0])
+  render(vm)
+  expect(state.confirm?.open).toBe(true)
+  state.confirm?.handleConfirm?.()
+  await vi.waitFor(() => {
+    expect(state.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['crag-host-subscription'],
+    })
+  })
+  expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+    { id: 'slot-a', kernel: 'cli-node', expected_tag: undefined },
+  ])
+  expect(toast.warning).toHaveBeenCalledExactlyOnceWith(
+    '1 台内核已安装并重启，1 个 CRAG 绑定待回收',
+    {
+      description:
+        '启用槽位回收后，请重装 cli-node 完成回收，额度以服务端确认为准。',
+    }
+  )
+  expect(toast.success).not.toHaveBeenCalled()
+  expect(render(vm)).toContain('重启完成，原调度限制保留；CRAG 绑定待回收')
+})
+
+it.each(['license_required', 'license_payload_key_mismatch'])(
+  'does not gate installation or recommend reissue based on the cached %s hint',
+  (code) => {
+    state.licenses['vm-old'] = {
+      status: 'valid',
+      valid: true,
+      vm_id: 'vm-old',
+      scope: 'host',
+    }
+    // Older backends may still return the hint. The install decision belongs to the server.
+    state.installLicenses = {
+      'vm-old': { status: 'invalid', valid: false, vm_id: 'vm-old', code },
+    }
+    const html = render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    expect(html).toContain('授权有效')
+    expect(html).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    expect(html).toContain('aria-label="安装 vm-old 并重启"')
+    expect(html).not.toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="安装 vm-old 并重启"/
+    )
+  }
+)
 
 describe('KVM CRAG repair on the kernel page', () => {
   it('offers explicit CRAG reinstall when the current kernel is cli-node', () => {
@@ -141,11 +352,12 @@ describe('KVM CRAG repair on the kernel page', () => {
 })
 
 describe('CRAG runtime on the kernel page', () => {
-  it('shows signed slots, runtime capacity and live details independent of the selected kernel', () => {
+  it('shows one remaining capacity and per-slot health independent of the selected kernel', () => {
     state.host = {
       ready: true,
       state: 'active',
       slot_limit: 1,
+      available_seats: 0,
       runtime: {
         running_vms: 3,
         ready_vms: 1,
@@ -159,6 +371,7 @@ describe('CRAG runtime on the kernel page', () => {
           'vm-old': {
             state: 'running',
             ready: false,
+            quota_blocked: true,
             scope: 'host',
             version: '3.0.8',
             active_requests: 0,
@@ -171,20 +384,19 @@ describe('CRAG runtime on the kernel page', () => {
     const html = render({ status: 'stopped' })
     expect(state.hostEnabled).toBe(true)
     expect(state.hostInterval).toBe(10_000)
-    expect(html).toMatch(/已兑换槽位<\/dt><dd[^>]*>1<\/dd>/)
-    expect(html).toMatch(/宿主机服役<\/dt><dd[^>]*>2<\/dd>/)
-    expect(html).toMatch(/可用运行名额<\/dt><dd[^>]*>0<\/dd>/)
-    expect(html).toMatch(/CRAG 服役 \/ 可用<\/dt><dd[^>]*>3 \/ 1<\/dd>/)
-    expect(html).toContain('已暂停宿主机 CRAG 调用')
-    expect(html).toContain('运行状态 1 台')
+    expect(html).toMatch(/使用中的槽位<\/span><span[^>]*>2<\/span>/)
+    expect(html).not.toContain('可用运行名额')
+    // 超额现在拆成「徽章=状态」+「文字=后果」两段，不再是一句连续文案。
+    expect(html).toContain('宿主订阅超额')
+    expect(html).toContain('仅超额槽暂停调度')
     expect(html).toContain('兑换槽位')
-    expect(html).toContain('服役中 / 暂不可用')
+    expect(html).toContain('超出订阅额度 / 暂停调度')
     expect(html).toContain('版本 3.0.8 · 处理中 0 · 排队 0 · 就绪处理槽 0')
 
     state.role = 'user'
     const userHtml = render()
-    expect(userHtml).not.toContain('宿主机服役')
-    expect(userHtml).not.toContain('服役中 / 暂不可用')
+    expect(userHtml).not.toContain('使用中的槽位')
+    expect(userHtml).not.toContain('超出订阅额度 / 暂停调度')
     expect(userHtml).not.toContain('兑换槽位')
     expect(state.hostEnabled).toBe(false)
     expect(state.hostInterval).toBe(false)
@@ -198,13 +410,13 @@ describe('CRAG runtime on the kernel page', () => {
       status: 'running',
     } as const
     const html = render(cragVm)
-    expect(html).toMatch(/可用运行名额<\/dt><dd[^>]*>待核对<\/dd>/)
+    expect(html).toMatch(/使用中的槽位<\/span><span[^>]*>待核对<\/span>/)
     expect(html).toContain('CRAG：运行状态未知')
 
     state.hostError = true
     const errorHtml = render(cragVm)
     expect(errorHtml).toContain('重装 vm-old 的 CRAG 并重启')
     expect(errorHtml).toContain('CRAG：运行状态未知')
-    expect(errorHtml).toMatch(/已兑换槽位<\/dt><dd[^>]*>待核对<\/dd>/)
+    expect(errorHtml).toMatch(/使用中的槽位<\/span><span[^>]*>待核对<\/span>/)
   })
 })

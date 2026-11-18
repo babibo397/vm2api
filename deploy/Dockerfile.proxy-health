@@ -1,10 +1,10 @@
-# Official v1.4.110 Linux amd64 release, with remote-slot, credit and lifecycle fixes.
+# Official v1.4.142 Linux amd64 release, with remote-slot, credit and lifecycle fixes.
 # Keep the base pinned so the image is reproducible and rollback is unambiguous.
-FROM ghcr.io/dofastted/vm2api:v1.4.110@sha256:5ffd18ed936c36b1ca0cdd35d9fd4787842c18657fc148f6377c52b69b7e0bf2
+FROM ghcr.io/dofastted/vm2api:v1.4.142@sha256:1967dae16bafdaa50f55829d81edeb0b04a9f3b49aa79f873d4ff0be7fcdbf77
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/babibo397/vm2api" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
-      org.opencontainers.image.version="1.4.110-local"
+      org.opencontainers.image.version="1.4.142-local"
 COPY src/server.mjs /opt/vm2api/src/server.mjs
 COPY src/lib/oauth/codex-quota-monitor.mjs src/lib/oauth/openai-quota.mjs /opt/vm2api/src/lib/oauth/
 COPY src/lib/protocol/codex-models.mjs /opt/vm2api/src/lib/protocol/codex-models.mjs

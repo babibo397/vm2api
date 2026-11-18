@@ -17,6 +17,7 @@ import { getVm } from '../../src/lib/vm/vm-registry.mjs'
 import { kernelFaults, rustKernelBusy, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot } from '../../src/lib/vm/slot-recovery.mjs'
+import { initializeSlotSeedFiles } from '../../src/lib/vm/slot-seed.mjs'
 import { activateFixture, issueUniversalCode, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 function fixture(t, extra = {}, { universalBeforeSlot = false } = {}) {
@@ -38,7 +39,19 @@ function fixture(t, extra = {}, { universalBeforeSlot = false } = {}) {
   return { root, vm, universalCode }
 }
 
+function kernelPolicyFixture(root, overrides) {
+  return {
+    initializeSlotSeedFiles: async (project, vm, host) => {
+      if (!vm.node_id) return initializeSlotSeedFiles(project, vm, host)
+      assert.equal(project, root)
+      assert.ok(getVm(project, vm.id))
+    },
+    ...overrides,
+  }
+}
+
 async function request(root, method, suffix, body, extra = {}, endpoint = '/vms/vm-switch') {
+  const { kernelPolicyOps, ...overrides } = extra
   const response = {}
   const handle = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
@@ -55,7 +68,8 @@ async function request(root, method, suffix, body, extra = {}, endpoint = '/vms/
       return true
     },
     proxyPool: { unbindVm() {} },
-    ...extra,
+    ...overrides,
+    kernelPolicyOps: kernelPolicyFixture(root, kernelPolicyOps),
   })
   await handle({ method }, {}, new URL(`http://localhost/api/panel${endpoint}${suffix}`))
   return response
@@ -92,6 +106,7 @@ test('switch holds admission and watchdog until the old request drains', async (
         restartRustKernel: async () => {
           assert.equal(inflight.get(vm.id), 0, 'no accepted request may be killed by cutover')
           assert.equal(getVm(root, vm.id).schedule_hold.reason, 'maintenance')
+          assert.ok(fs.existsSync(path.join(root, 'vms', vm.id, 'cli-home', '.claude', 'settings.json')))
           events.push('restart')
           return { ok: true }
         },
@@ -332,7 +347,7 @@ for (const placement of ['local', 'cluster']) {
       assert.deepEqual(events, ['hold', 'project', 'release'])
     })
 
-    test(`unlicensed ${placement} KVM ${entry} cannot switch or change scheduling`, async (t) => {
+    test(`unlicensed ${placement} KVM ${entry} allows switching to CRAG and defers running start cleanly`, async (t) => {
       const { root, vm } = fixture(t, {
         dataplane: entry === 'default' ? undefined : 'wrap',
         ...(placement === 'cluster' ? { node_id: 'node-1' } : {}),
@@ -340,14 +355,28 @@ for (const placement of ['local', 'cluster']) {
         schedule_off: true,
       })
       seedEncryptedPackage(root)
-      const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
+      const routing = { inference: { dataplane: 'wrap' } }
+      const events = []
       const operations = {
-        routingConfig: { inference: { dataplane: 'wrap' } },
-        persistRoutingPatch: async () => assert.fail('unlicensed switch must not change the global default'),
-        kernelWatchdog: { hold: async () => assert.fail('unlicensed switch must not enter maintenance') },
+        routingConfig: routing,
+        persistRoutingPatch: async (patch) => Object.assign(routing.inference, patch.inference),
+        kernelWatchdog: {
+          hold: async () => events.push('hold'),
+          release: () => events.push('release'),
+          reset: () => events.push('reset'),
+        },
         kernelPolicyOps: {
-          restartRustKernel: async () => assert.fail('unlicensed switch must not restart the guest'),
-          startSlotReady: async () => assert.fail('unlicensed switch must not recreate the runner'),
+          writeKernelConfig: (project, selected, options) =>
+            writeKernelConfig(project, selected, { ...options, publish: false }),
+          restartRustKernel: async () => {
+            events.push('restart')
+            return { ok: false, code: 'license_required', error: 'Activate CRAG license' }
+          },
+          stopSlot: async () => {
+            events.push('stop')
+            return { ok: true, runtime: { stopped: true } }
+          },
+          startSlotReady: async () => assert.fail('KVM switch must not recreate the runner'),
         },
       }
       const response =
@@ -361,10 +390,17 @@ for (const placement of ['local', 'cluster']) {
               operations,
               '/dataplane',
             )
-      assert.equal(response.status, 403, JSON.stringify(response.body))
-      assert.match(response.body.error.code, /^license_/)
-      assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), record)
-      assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'run', 'kernel.json')), false)
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      const payload = entry === 'slot' ? response.body.data : response.body.data.items[0]
+      assert.equal(payload.deferred_start, true)
+      assert.equal(payload.deferred_reason, 'license_required')
+      const saved = getVm(root, vm.id)
+      assert.equal(saved.status, 'stopped')
+      assert.equal(saved.schedule_off, true)
+      assert.equal(saved.unschedulable, undefined)
+      assert.equal(entry === 'default' ? routing.inference.dataplane : saved.dataplane, 'crag')
+      assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'run', 'kernel.json')), true)
+      assert.deepEqual(events, ['hold', 'restart', 'stop', 'reset', 'release'])
     })
   }
 }
@@ -772,6 +808,7 @@ async function kernelSwitchApi(t, root, operations = {}) {
     },
     proxyPool: {},
     ...operations,
+    kernelPolicyOps: kernelPolicyFixture(root, operations.kernelPolicyOps),
   })
   const server = http.createServer((req, res) => {
     Promise.resolve(handler(req, res, new URL(req.url, 'http://localhost'))).catch((error) => {
@@ -876,10 +913,9 @@ test('a failed cluster cutover exposes its error and retrying the saved target r
   assert.equal(unitCircuit.view(vm.id).state, 'closed')
 })
 
-test('async kernel switching preserves stopped intent and rejects unlicensed or non-admin admission', async (t) => {
+test('async kernel switching preserves stopped intent when unlicensed and rejects non-admin admission', async (t) => {
   const { root, vm } = fixture(t, { node_id: 'node-1', status: 'stopped', schedule_off: true })
   seedEncryptedPackage(root)
-  const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
   const { call, finished } = await kernelSwitchApi(t, root, {
     kernelPolicyOps: {
       writeKernelConfig: (project, selected, options) =>
@@ -887,16 +923,14 @@ test('async kernel switching preserves stopped intent and rejects unlicensed or 
       startSlotReady: async () => assert.fail('a stopped slot must not be started by kernel selection'),
     },
   })
-  assert.equal((await call('POST', { dataplane: 'crag' })).status, 403)
-  assert.equal((await call()).body.data, null)
-  assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), record)
   for (const role of ['super', 'user']) {
     assert.equal((await call('GET', undefined, role)).status, 403)
     assert.equal((await call('POST', { dataplane: 'wrap' }, role)).status, 403)
   }
-  activateCragLicense(root, vm, issueUniversalCode(root).code)
   assert.equal((await call('POST', { dataplane: 'crag' })).status, 202)
   assert.equal((await finished()).status, 'succeeded')
+  assert.equal(getVm(root, vm.id).dataplane, 'crag')
+  assert.equal(getVm(root, vm.id).crag_kernel_version, 'v2')
   assert.equal(getVm(root, vm.id).status, 'stopped')
   assert.equal(getVm(root, vm.id).schedule_off, true)
 })

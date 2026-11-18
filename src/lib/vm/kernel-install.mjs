@@ -1,10 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { describeKernelCatalog, reserveKernelInstallCache } from '../admin/kernel-catalog.mjs'
 import { isCragPayloadTag } from '../admin/release-kernel.mjs'
 import { isReleaseTag } from '../admin/release.mjs'
-import { writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
+import { cancelRustKernelStart, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import {
   applyHold,
   applyClearHold,
@@ -21,20 +21,41 @@ import { ensureHostPrivateDir } from './private-dir.mjs'
 import { getVm, listVms, patchVmRecord, vmHasSchedulableCredential, waitForSlotDrain } from './vm-registry.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { startSlotReady, stopSlot } from './slot-runtime.mjs'
-import { officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
-import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
+import { inspectInstalledCragEntry, officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
+import {
+  installedCragV2Root,
+  materializeResolvedKernel,
+  stageCragV2Tree,
+  verifyCragV2Tree,
+} from './wrap-cli-runtime.mjs'
+import { initializeSlotSeedFiles } from './slot-seed.mjs'
+import { slotHost } from './slot-host.mjs'
 import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { clearRustHealthCache } from '../transport/kernel-router.mjs'
+import { rustKernelHealth, rustKernelProcessUp } from '../transport/rust-kernel-client.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
 const INTERRUPTED_COMMAND =
   /^(node_not_ready|ssh_timeout|ssh_connect_failed|ssh_closed|ssh_link_error|exec_timeout|docker_timeout|docker_io_failed|ECONNRESET|EPIPE)$/
-// Only exceptional installer holds may be cleared by a later explicit start.
+// Exceptional switch holds may be cleared by a later explicit start.
 // Key by record path so independent projects cannot release each other's slot.
 const safetyHolds = new Map()
+
+export function hasKernelInstallSafetyHold(projectRoot, id, watchdog) {
+  return !!watchdog && safetyHolds.get(path.join(projectRoot, 'vms', `${id}.json`)) === watchdog
+}
+
+/** Preserve an existing watchdog hold after a confirmed stop could not be persisted. */
+export function retainKernelInstallSafetyHold(projectRoot, id, watchdog) {
+  if (typeof watchdog?.hold !== 'function') return false
+  safetyHolds.set(path.join(projectRoot, 'vms', `${id}.json`), watchdog)
+  return true
+}
 
 function clearInstallHold(record) {
   const operation = record.kernel_operation
@@ -64,6 +85,140 @@ const failure = (target, code, error, stopped = false) => ({
   error,
   stopped,
 })
+const ADMISSION_ERRORS = new Map([
+  ['crag_subscription_unavailable', 'CRAG 订阅状态暂时读不到。槽位和原服务未改动，请稍后重试。'],
+  ['crag_subscription_authority_unavailable', '授权服务暂时没有响应。槽位和原服务未改动，请稍后重试。'],
+  ['crag_subscription_busy', 'CRAG 启动操作繁忙。槽位和原服务未改动，请稍后重试。'],
+  ['license_crag_host_usage_unverified', '暂时对不上宿主机运行额度。槽位和原服务未改动，请稍后重试。'],
+  ['license_crag_host_over_quota', '宿主订阅的运行槽位已满。原服务未改动；释放其他运行槽或增加额度后再更新。'],
+])
+function installLicenseFailure(target, check) {
+  if (check.code === 'license_payload_key_mismatch') {
+    return failure(
+      target,
+      'crag_subscription_migration_required',
+      '下载包与已有许可使用不同的加密密钥。请选择兼容版本，或先完成授权迁移。',
+    )
+  }
+  return failure(
+    target,
+    check.code || 'license_required',
+    ADMISSION_ERRORS.get(check.code) || check.error || '请先激活 CRAG 授权',
+  )
+}
+
+const healthy = (boot) => boot?.ok && boot.rust_ok !== false && boot.rust?.ok !== false && boot.kernel?.ok !== false
+
+function markRunning(record, boot, projectRoot) {
+  record.status = 'running'
+  record.runtime = { ...record.runtime, ...(boot.runtime || boot.docker?.runtime), stopped: false }
+  const hasCredential = vmHasSchedulableCredential(record, projectRoot)
+  if (!hasCredential && !record.unschedulable) applyUnschedulable(record, 'no_credential')
+  else if (hasCredential && record.unschedulable?.reason === 'runtime_start_failed') {
+    applyClearUnschedulable(record, { by: 'operator' })
+  }
+  if (record.schedule_off_reason === 'stopped') {
+    delete record.schedule_off
+    delete record.schedule_off_reason
+  }
+  clearInstallHold(record)
+  delete record.kernel_restart_pending
+}
+
+function manifestDigest(root) {
+  return createHash('sha256')
+    .update(fs.readFileSync(path.join(root, 'manifest.json')))
+    .digest('hex')
+}
+
+function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
+  const dest = installedCragV2Root(projectRoot, vm)
+  if (!dest && vm.kernel_installation?.kernel !== 'crag') return null
+  const verified = dest && verifyCragV2Tree(dest, { allowPreviousClaude: true })
+  const grant = licenseCheck(projectRoot, vm, routing, { preferInstalled: true })
+  if (!verified?.ok || !grant.ok || !inspectInstalledCragEntry(projectRoot, vm).ok) {
+    throw Object.assign(new Error('Previous CRAG payload is not a verified rollback source'), {
+      code: 'crag_rollback_unverified',
+    })
+  }
+  const digest = manifestDigest(dest)
+  // Copy distribution files only; never snapshot a license, H2 roster or slot identity.
+  const backup = fs.mkdtempSync(path.join(projectRoot, 'vms', vm.id, 'crag-rollback-'))
+  const pkg = path.join(backup, 'package')
+  try {
+    for (const rel of ['manifest.json', ...Object.keys(verified.manifest.sha256)]) {
+      const out = path.join(pkg, rel)
+      fs.mkdirSync(path.dirname(out), { recursive: true })
+      fs.copyFileSync(path.join(dest, rel), out)
+    }
+    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg).ok) {
+      throw Object.assign(new Error('CRAG rollback copy failed verification'), { code: 'crag_rollback_unverified' })
+    }
+    return { backup, pkg, dest, digest }
+  } catch (error) {
+    fs.rmSync(backup, { recursive: true, force: true })
+    throw error
+  }
+}
+
+async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bootAttempted }) {
+  const current = getVm(projectRoot, vm.id)
+  if (!current) return null
+  if (bootAttempted) {
+    const halt = await (ops.stopSlot || stopSlot)(current)
+    if (!halt?.ok) return null
+    const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(current)
+    if (!policy?.ok) return null
+  }
+  if (!verifyCragV2Tree(rollback.pkg).ok || manifestDigest(rollback.pkg) !== rollback.digest) return null
+  const tree = stageCragV2Tree(rollback.pkg, rollback.dest)
+  if (!tree.ok) return null
+  tree.commit()
+  const checked = (ops.checkCragLicense || checkCragLicense)(projectRoot, vm, routing, { preferInstalled: true })
+  if (!checked.ok || manifestDigest(rollback.dest) !== rollback.digest) return null
+
+  const prior = patchVmRecord(projectRoot, vm.id, (record) => {
+    for (const key of ['dataplane', 'crag_kernel_version', 'kernel_installation']) {
+      if (Object.hasOwn(vm, key)) record[key] = vm[key]
+      else delete record[key]
+    }
+  })
+  if (!prior) return null
+  try {
+    const boot = await (ops.startSlotReady || startSlotReady)(prior, projectRoot, {
+      routing,
+      allowMissingCredential: true,
+      useInstalledCrag: true,
+    })
+    if (
+      healthy(boot) &&
+      boot.rust?.ok === true &&
+      boot.rust.skipped !== true &&
+      manifestDigest(rollback.dest) === rollback.digest
+    ) {
+      const exec = slotExec(projectRoot, { ...prior, runtime: boot.runtime || boot.docker?.runtime || prior.runtime })
+      const health = await (ops.rustKernelHealth || rustKernelHealth)(exec, { requireInternalToken: true })
+      if (
+        health?.internalTokenAuthenticated === true &&
+        rustKernelProcessUp(health) &&
+        health.healthy !== false &&
+        health.license_valid !== false &&
+        health.recovering !== true &&
+        Number(health.cli_pid) > 0
+      ) {
+        const running = patchVmRecord(projectRoot, vm.id, (record) => markRunning(record, boot, projectRoot))
+        if (running) return running
+      }
+    }
+  } catch {
+    // The rollback may have started a container before losing health or persistence.
+  }
+  const halt = await (ops.stopSlot || stopSlot)(prior)
+  if (!halt?.ok) return null
+  await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(prior)
+  return null
+}
+
 const report = (items) => {
   const failed_count = items.filter((item) => !item.ok).length
   return { ok: failed_count === 0, total: items.length, ok_count: items.length - failed_count, failed_count, items }
@@ -149,6 +304,34 @@ export function validateKernelTargets(projectRoot, targets) {
   return { ok: true }
 }
 
+const CANCELLED = 'kernel_install_cancelled'
+/** vmId → in-flight install, so an operator can abandon one without waiting on it. */
+const activeInstalls = new Map()
+
+/**
+ * Force-cancel one VM's install. Frees the kernel cache reservation at once so other
+ * VMs can install, aborts a pending kernel start, and stops the installer at its next
+ * checkpoint. A slot already stopped is left stopped under maintenance for review.
+ */
+export function cancelKernelInstall(vmId) {
+  const active = activeInstalls.get(String(vmId || ''))
+  if (!active) return { ok: false, code: 'kernel_install_not_running', error: '该虚拟机没有进行中的安装' }
+  active.control.cancelled = true
+  active.releaseCache?.()
+  cancelRustKernelStart(vmId)
+  return { ok: true, id: vmId, kernel: active.kernel, phase: active.phase() }
+}
+
+export function listActiveKernelInstalls() {
+  return [...activeInstalls.entries()].map(([id, active]) => ({
+    id,
+    kernel: active.kernel,
+    phase: active.phase(),
+    started_at: active.started_at,
+    cancelled: active.control.cancelled,
+  }))
+}
+
 /** Installation owns stop, replacement and verified restart under one record lock. */
 export async function installKernelTargets({
   projectRoot,
@@ -156,6 +339,8 @@ export async function installKernelTargets({
   routing = {},
   watchdog,
   poolScheduler,
+  cragSubscription,
+  releaseStoppedBinding = cragSubscription?.releaseStoppedBinding?.bind(cragSubscription),
   ops = {},
   resumeId = null,
 }) {
@@ -181,9 +366,20 @@ export async function installKernelTargets({
         let operationPersisted = false
         let interrupted = false
         let clusterVm = false
+        let rollback
         let releaseCache
         const inheritedSafetyHold = !!watchdog && safetyHolds.get(file) === watchdog
         let phase = 'kernel_preflight_failed'
+        const control = { cancelled: false }
+        const active = {
+          control,
+          kernel: target.kernel,
+          started_at: new Date().toISOString(),
+          phase: () => phase,
+          releaseCache: null,
+        }
+        activeInstalls.set(target.id, active)
+        const cancelled = () => (control.cancelled ? failure(target, CANCELLED, '安装已被强制取消', stopped) : null)
         try {
           // Hold inside the VM lock: another installer cannot release this hold early.
           // Drain a watchdog restart already past admission before touching the slot.
@@ -198,6 +394,8 @@ export async function installKernelTargets({
           if (resumeId) {
             operationId = resumeId
             operationPersisted = true
+            stopped = vm.status === 'stopped'
+            stoppedPersisted = stopped
           }
           const unsupported = placementFailure(vm, target.kernel)
           if (unsupported) return failure(target, unsupported.code, unsupported.error)
@@ -205,181 +403,302 @@ export async function installKernelTargets({
             releaseCache = reserveKernelInstallCache(projectRoot, target.kernel)
             if (!releaseCache) {
               interrupted = Boolean(resumeId)
-              return failure(target, 'kernel_pull_busy', '正在重装同类内核，请稍后重试')
+              return failure(target, 'kernel_pull_busy', '正在重装同类内核，请稍后重试或强制取消进行中的安装')
             }
+            active.releaseCache = releaseCache
           }
           const desired = desiredVm(vm, target.kernel)
           const catalog = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
           const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
-          if (target.expected_tag && product.release_tag !== target.expected_tag)
-            return failure(target, 'kernel_release_changed', `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`)
           if (isKvmRuntime(vm) && target.kernel !== 'crag') {
             const crag = catalog.find((item) => item.id === 'crag')
             if (!crag?.ready)
               return failure(target, crag?.code || 'crag_v2_package_missing', crag?.error || '请先拉取 CRAG 预装包')
           }
-          const matchesPayload = (entry) => !target.payload_tag || target.payload_tag === entry?.payload_tag
-          const changedPayload = (stopped = false) =>
-            failure(target, 'crag_payload_changed', 'CRAG 下载版本已变更，请刷新并重新确认安装', stopped)
-          if (!matchesPayload(product)) return changedPayload()
-          if (target.kernel === 'crag') {
-            const grant = (ops.checkCragLicense || checkCragLicense)(projectRoot, desired, routing, {
-              preferInstalled: false,
-            })
-            if (!grant.ok) return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')
-          }
-          phase = 'kernel_operation_persist_failed'
-          operationId = resumeId || randomUUID()
-          patchVmRecord(projectRoot, target.id, (record) => {
-            migrateScheduleRecord(record)
-            const previous = record.kernel_operation
-            record.kernel_operation = {
-              id: operationId,
-              kernel: target.kernel,
-              ...(target.expected_tag ? { expected_tag: target.expected_tag } : {}),
-              ...(target.payload_tag ? { payload_tag: target.payload_tag } : {}),
-              phase: 'pending',
-              recovery_attempts: resumeId ? (previous.recovery_attempts || 0) + 1 : 0,
-              previous_hold: previous ? previous.previous_hold : record.schedule_hold || null,
-              schedule_off: record.schedule_off === true,
-              started_at: previous?.started_at || new Date().toISOString(),
-            }
-            applyHold(record, HOLD_MAINTENANCE, { tag: operationId })
-          })
-          operationPersisted = true
-          phase = 'kernel_drain_failed'
-          const drained = await waitForSlotDrain(poolScheduler, [target.id])
-          if (!drained.ok) return failure(target, phase, '在途请求未结束，未重启内核')
-          if (target.expected_tag || target.payload_tag) {
-            const current = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
-              (item) => item.id === target.kernel,
-            )
-            if (target.expected_tag && current?.release_tag !== target.expected_tag)
+          const checkPin = (entry, stopped = false) => {
+            if (target.expected_tag && entry?.release_tag !== target.expected_tag) {
               return failure(
                 target,
                 'kernel_release_changed',
                 `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`,
+                stopped,
               )
-            if (!matchesPayload(current)) return changedPayload()
+            }
+            if (target.payload_tag && entry?.payload_tag !== target.payload_tag) {
+              return failure(target, 'crag_payload_changed', 'CRAG 下载版本已变更，请刷新并重新确认安装', stopped)
+            }
           }
-          phase = 'kernel_stop_failed'
-          const halt = await (ops.stopSlot || stopSlot)(vm)
-          if (!halt?.ok) {
-            interrupted = !!vm.node_id && INTERRUPTED_COMMAND.test(halt?.code || '')
-            return failure(target, halt?.code || phase, halt?.error || '虚拟机停止失败')
+          const stalePin = checkPin(product)
+          if (stalePin) return stalePin
+          const licenseCheck = ops.checkCragLicense || checkCragLicense
+          const checkTargetLicense = () => licenseCheck(projectRoot, desired, routing, { preferInstalled: false })
+          const grant = target.kernel === 'crag' ? checkTargetLicense() : null
+          const canAuthorizeInstall = (check) =>
+            ['license_required', 'license_crag_host_over_quota', 'license_binding_mismatch'].includes(check?.code) &&
+            !!(target.expected_tag || target.payload_tag) &&
+            !resumeId &&
+            typeof cragSubscription?.authorizeInstall === 'function'
+          if (grant && !grant.ok && !canAuthorizeInstall(grant)) return installLicenseFailure(target, grant)
+
+          let bootAttempted = false
+          let restartSuspended = false
+          const resetHealth = (running) => {
+            watchdog?.reset?.(target.id)
+            clearRustHealthCache(target.id)
+            poolScheduler?.healthCache?.delete?.(target.id)
+            unitCircuit.reset(accountIdOf(running, projectRoot))
           }
-          stopped = true
-          // Commit STOPPED immediately, even if replacement or config subsequently fails.
-          // Re-read owned fields instead of overwriting credentials changed during drain.
-          phase = 'kernel_stop_persist_failed'
-          const halted = patchVmRecord(projectRoot, target.id, (record) => {
-            record.status = 'stopped'
-            record.runtime = { ...record.runtime, ...halt.runtime, stopped: true, pid: null, ip: null }
-          })
-          if (!halted) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
-          stoppedPersisted = true
-          phase = 'kernel_restart_policy_failed'
-          const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
-          if (!policy?.ok) return failure(target, policy?.code || phase, policy?.error || '无法关闭容器自动重启', true)
-          const candidate = desiredVm(halted, target.kernel)
-          const owner = officialCcUidGid(target.id)
-          phase = 'kernel_materialize_failed'
-          // Pull publishes immutable packages by a synchronous pointer swap. Observe the
-          // actual version in the same event-loop turn as the synchronous materializer.
-          const installedProduct = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
-            (item) => item.id === target.kernel,
-          )
-          if (!installedProduct?.ready)
-            return failure(
-              target,
-              installedProduct?.code || 'kernel_package_missing',
-              installedProduct?.error || '内核缓存已变化，请重新拉取',
-              true,
-            )
-          if (target.expected_tag && installedProduct.release_tag !== target.expected_tag)
-            return failure(
-              target,
-              'kernel_release_changed',
-              `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`,
-              true,
-            )
-          if (!matchesPayload(installedProduct)) return changedPayload(true)
-          const baked = !!String(candidate.node_id || '').trim()
-          const laid = baked
-            ? await (ops.deployBakedKernel || deployBakedKernel)(projectRoot, candidate, target.kernel)
-            : await (ops.materializeResolvedKernel || materializeResolvedKernel)(projectRoot, candidate, {
-                ...owner,
-                routing,
+          const switchKernel = async () => {
+            phase = 'kernel_operation_persist_failed'
+            operationId = resumeId || randomUUID()
+            patchVmRecord(projectRoot, target.id, (record) => {
+              migrateScheduleRecord(record)
+              const previous = record.kernel_operation
+              record.kernel_operation = {
+                id: operationId,
+                kernel: target.kernel,
+                ...(target.expected_tag ? { expected_tag: target.expected_tag } : {}),
+                ...(target.payload_tag ? { payload_tag: target.payload_tag } : {}),
+                phase: 'pending',
+                recovery_attempts: resumeId ? (previous.recovery_attempts || 0) + 1 : 0,
+                previous_hold: previous ? previous.previous_hold : record.schedule_hold || null,
+                schedule_off: record.schedule_off === true,
+                started_at: previous?.started_at || new Date().toISOString(),
+              }
+              applyHold(record, HOLD_MAINTENANCE, { tag: operationId })
+            })
+            operationPersisted = true
+            phase = 'kernel_drain_failed'
+            const drained = await waitForSlotDrain(poolScheduler, [target.id])
+            if (cancelled()) return cancelled()
+            if (!drained.ok) return failure(target, phase, '在途请求未结束，未重启内核')
+
+            const currentProduct = () =>
+              (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
+                (item) => item.id === target.kernel,
+              )
+            const verifyPin = () => {
+              if (!target.expected_tag && !target.payload_tag) return
+              const current = currentProduct()
+              const changed = checkPin(current)
+              if (changed) return changed
+              if (!current?.ready) {
+                return failure(
+                  target,
+                  current?.code || 'kernel_package_missing',
+                  current?.error || '内核缓存已变化，请重新拉取',
+                )
+              }
+            }
+            const stalePin = verifyPin()
+            if (stalePin) return stalePin
+            const pendingGrant = target.kernel === 'crag' ? checkTargetLicense() : null
+            if (pendingGrant && !pendingGrant.ok) {
+              if (!canAuthorizeInstall(pendingGrant)) return installLicenseFailure(target, pendingGrant)
+              try {
+                await cragSubscription.authorizeInstall(desired)
+              } catch (error) {
+                const code = error?.code || 'crag_subscription_install_failed'
+                const messages = {
+                  host_subscription_inactive: '本机没有已激活且有效的宿主订阅。请先激活订阅，或选用现有许可兼容的包。',
+                  slot_limit_reached: '宿主订阅没有剩余绑定槽位。请释放额度，或选用现有许可兼容的包。',
+                  crag_subscription_sync_pending: '上一次订阅操作未确认。请先同步宿主订阅状态，再重试重装。',
+                  crag_subscription_authority_unavailable:
+                    '授权服务器未确认本次操作。请先刷新宿主订阅状态，再重试重装。',
+                  crag_subscription_migration_required: '此槽已有宿主订阅绑定。请选择兼容版本，或先完成授权迁移。',
+                }
+                const message = Object.hasOwn(messages, code) ? messages[code] : `未能为下载包签发本槽许可（${code}）。`
+                return failure(target, code, message)
+              }
+              const stalePin = verifyPin()
+              if (stalePin) return stalePin
+              const grant = checkTargetLicense()
+              if (!grant.ok) return installLicenseFailure(target, grant)
+            }
+            if (
+              !resumeId &&
+              !clusterVm &&
+              target.kernel === 'crag' &&
+              vm.status === 'running' &&
+              resolveKernelDataplane(vm, routing) === 'crag'
+            ) {
+              phase = 'crag_rollback_unverified'
+              rollback = prepareCragRollback(projectRoot, vm, routing, licenseCheck)
+              if (rollback) {
+                patchVmRecord(projectRoot, target.id, (record) => {
+                  record.kernel_operation.rollback_package = path.basename(rollback.backup)
+                  record.kernel_operation.rollback_manifest_sha256 = rollback.digest
+                  if (vm.kernel_installation) record.kernel_operation.rollback_installation = vm.kernel_installation
+                })
+              }
+            }
+            if (cancelled()) return cancelled()
+            phase = 'kernel_stop_failed'
+            const halt = await (ops.stopSlot || stopSlot)(vm)
+            if (!halt?.ok) {
+              interrupted = !!vm.node_id && INTERRUPTED_COMMAND.test(halt?.code || '')
+              return failure(target, halt?.code || phase, halt?.error || '虚拟机停止失败')
+            }
+            stopped = true
+            // Commit STOPPED immediately, even if replacement or config subsequently fails.
+            // Re-read owned fields instead of overwriting credentials changed during drain.
+            phase = 'kernel_stop_persist_failed'
+            const halted = patchVmRecord(projectRoot, target.id, (record) => {
+              record.status = 'stopped'
+              record.runtime = { ...record.runtime, ...halt.runtime, stopped: true, pid: null, ip: null }
+            })
+            if (!halted) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
+            stoppedPersisted = true
+            phase = 'kernel_restart_policy_failed'
+            const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
+            if (!policy?.ok)
+              return failure(target, policy?.code || phase, policy?.error || '无法关闭容器自动重启', true)
+            restartSuspended = true
+            const candidate = desiredVm(halted, target.kernel)
+            const owner = officialCcUidGid(target.id)
+            phase = 'kernel_materialize_failed'
+            // Pull publishes immutable packages by a synchronous pointer swap. Observe the
+            // actual version in the same event-loop turn as the synchronous materializer.
+            const installedProduct = currentProduct()
+            if (!installedProduct?.ready) {
+              return failure(
+                target,
+                installedProduct?.code || 'kernel_package_missing',
+                installedProduct?.error || '内核缓存已变化，请重新拉取',
+                true,
+              )
+            }
+            const changedBeforeMaterialize = checkPin(installedProduct, true)
+            if (changedBeforeMaterialize) return changedBeforeMaterialize
+            let bindingRelease
+            if (target.kernel !== 'crag' && typeof releaseStoppedBinding === 'function') {
+              phase = 'kernel_selection_persist_failed'
+              const selected = patchVmRecord(projectRoot, target.id, (record) => {
+                record.dataplane = candidate.dataplane
+                delete record.crag_kernel_version
               })
-          if (!laid?.ok) {
-            interrupted = baked && INTERRUPTED_COMMAND.test(laid?.code || '')
-            return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
-          }
-          phase = 'kernel_config_failed'
-          const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
-            routing,
-            timezone: candidate.timezone,
-            publish: false,
-          })
-          if (!config?.configPath) return failure(target, phase, '内核配置生成失败', true)
-          if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
-          phase = 'kernel_selection_persist_failed'
-          const saved = patchVmRecord(projectRoot, target.id, (record) => {
-            record.dataplane = candidate.dataplane
-            if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
-            else delete record.crag_kernel_version
-            record.kernel_installation = {
+              if (!selected) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
+              // Replacing the preinstalled CRAG package can replace its trust key.
+              // Revoke the old permit while that verified package is still present.
+              phase = 'crag_subscription_release_failed'
+              try {
+                bindingRelease = await releaseStoppedBinding(selected)
+              } catch (error) {
+                return failure(target, error.code || phase, 'CRAG 订阅绑定未能完成释放，请同步订阅状态后重试。', true)
+              }
+            }
+            phase = 'kernel_materialize_failed'
+            const baked = !!String(candidate.node_id || '').trim()
+            const laid = baked
+              ? await (ops.deployBakedKernel || deployBakedKernel)(projectRoot, candidate, target.kernel)
+              : await (ops.materializeResolvedKernel || materializeResolvedKernel)(projectRoot, candidate, {
+                  ...owner,
+                  routing,
+                })
+            if (!laid?.ok) {
+              interrupted = baked && INTERRUPTED_COMMAND.test(laid?.code || '')
+              return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
+            }
+            phase = 'kernel_seed_failed'
+            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate))
+            phase = 'kernel_config_failed'
+            const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
+              routing,
+              timezone: candidate.timezone,
+              publish: false,
+            })
+            if (!config?.configPath) return failure(target, phase, '内核配置生成失败', true)
+            if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
+            phase = 'kernel_selection_persist_failed'
+            const saved = patchVmRecord(projectRoot, target.id, (record) => {
+              record.dataplane = candidate.dataplane
+              if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
+              else delete record.crag_kernel_version
+              record.kernel_installation = {
+                kernel: target.kernel,
+                version: installedProduct.version ?? null,
+                ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+                installed_at: new Date().toISOString(),
+              }
+            })
+            if (!saved) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
+            if (cancelled()) return cancelled()
+            phase = 'kernel_start_failed'
+            bootAttempted = true
+            const boot = await (ops.startSlotReady || startSlotReady)(saved, projectRoot, {
+              routing,
+              ...(target.kernel === 'crag' && {
+                allowMissingCredential: true,
+                ...(!baked && { useInstalledCrag: true }),
+              }),
+            })
+            if (cancelled()) return cancelled()
+            if (!healthy(boot) || (target.kernel === 'crag' && boot.rust?.skipped === true)) {
+              interrupted = baked && INTERRUPTED_COMMAND.test(boot?.code || '')
+              return failure(target, boot?.code || phase, boot?.error || '内核重启或健康检查失败', true)
+            }
+            phase = 'kernel_running_persist_failed'
+            const running = patchVmRecord(projectRoot, target.id, (record) => markRunning(record, boot, projectRoot))
+            if (!running) return failure(target, 'vm_not_found', '虚拟机记录已移除', false)
+            installed = true
+            stopped = false
+            resetHealth(running)
+            return {
+              id: target.id,
               kernel: target.kernel,
+              ok: true,
+              stopped: false,
+              restarted: true,
+              schedulable: running.schedulable,
+              status: running.status,
               version: installedProduct.version ?? null,
               ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
-              installed_at: new Date().toISOString(),
+              ...(bindingRelease?.reclaim_pending && { reclaim_pending: true }),
             }
-          })
-          if (!saved) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
-          phase = 'kernel_start_failed'
-          const boot = await (ops.startSlotReady || startSlotReady)(saved, projectRoot, { routing })
-          if (!boot?.ok || boot.rust_ok === false || boot.rust?.ok === false || boot.kernel?.ok === false) {
-            interrupted = baked && INTERRUPTED_COMMAND.test(boot?.code || '')
-            return failure(target, boot?.code || phase, boot?.error || '内核重启或健康检查失败', true)
           }
-          phase = 'kernel_running_persist_failed'
-          const running = patchVmRecord(projectRoot, target.id, (record) => {
-            record.status = 'running'
-            record.runtime = { ...record.runtime, ...(boot.runtime || boot.docker?.runtime), stopped: false }
-            const hasCredential = vmHasSchedulableCredential(record, projectRoot)
-            if (!hasCredential && !record.unschedulable) applyUnschedulable(record, 'no_credential')
-            else if (hasCredential && record.unschedulable?.reason === 'runtime_start_failed') {
-              applyClearUnschedulable(record, { by: 'operator' })
+          const run = async () => {
+            let result
+            let thrown
+            try {
+              result = await switchKernel()
+            } catch (error) {
+              thrown = error
             }
-            // A prior install's stopped flag is not an independent operator off switch.
-            if (record.schedule_off_reason === 'stopped') {
-              delete record.schedule_off
-              delete record.schedule_off_reason
+            if (rollback && stopped && !installed && restartSuspended) {
+              let recovered
+              try {
+                recovered = await restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bootAttempted })
+              } catch {
+                // Keep the maintenance hold and the verified backup for an operator.
+              }
+              const failed = result || failure(target, thrown?.code || phase, '新内核安装或启动失败', true)
+              if (recovered) {
+                installed = true
+                stopped = false
+                resetHealth(recovered)
+                return {
+                  ...failed,
+                  stopped: false,
+                  rolled_back: true,
+                  error: `${failed.error}；已恢复并验证原 CRAG 版本`,
+                }
+              }
+              return { ...failed, rolled_back: false, error: `${failed.error}；未能验证原版本恢复，请检查保留的回滚包` }
             }
-            clearInstallHold(record)
-            delete record.kernel_restart_pending
-          })
-          if (!running) return failure(target, 'vm_not_found', '虚拟机记录已移除', false)
-          installed = true
-          stopped = false
-          watchdog?.reset?.(target.id)
-          clearRustHealthCache(target.id)
-          poolScheduler?.healthCache?.delete?.(target.id)
-          const accountId = accountIdOf(running, projectRoot)
-          unitCircuit.reset(accountId)
-          return {
-            id: target.id,
-            kernel: target.kernel,
-            ok: true,
-            stopped: false,
-            restarted: true,
-            schedulable: running.schedulable,
-            status: running.status,
-            version: installedProduct.version ?? null,
-            ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+            if (thrown) throw thrown
+            return result
           }
+          const result = await withCragRuntimeAdmission(desired, projectRoot, { routing, install: true }, run)
+          return result.id === target.id
+            ? result
+            : failure(
+                target,
+                result.code || 'crag_runtime_admission_failed',
+                ADMISSION_ERRORS.get(result.code) || result.error || 'CRAG 运行准入失败',
+                stopped,
+              )
         } catch (error) {
           interrupted = clusterVm && INTERRUPTED_COMMAND.test(error?.code || '')
           return failure(
@@ -391,7 +710,16 @@ export async function installKernelTargets({
             stopped,
           )
         } finally {
+          if (activeInstalls.get(target.id) === active) activeInstalls.delete(target.id)
           releaseCache?.()
+          if (control.cancelled) phase = CANCELLED
+          if (rollback && !stopped) {
+            try {
+              fs.rmSync(rollback.backup, { recursive: true, force: true })
+            } catch {
+              console.warn(`[kernel-install] ${target.id} rollback package cleanup failed`)
+            }
+          }
           if (operationPersisted && !installed) {
             // Lost acknowledgements retain intent; deterministic failures need operator attention.
             try {
@@ -420,7 +748,14 @@ export async function installKernelTargets({
 }
 
 /** Resume only interrupted commands; the durable marker survives control-plane and SSH loss. */
-export async function resumePendingKernelInstalls({ projectRoot, routing = {}, watchdog, poolScheduler, ops = {} }) {
+export async function resumePendingKernelInstalls({
+  projectRoot,
+  routing = {},
+  watchdog,
+  poolScheduler,
+  releaseStoppedBinding,
+  ops = {},
+}) {
   const items = []
   for (const summary of listVms(projectRoot)) {
     const vm = getVm(projectRoot, summary.id)
@@ -429,7 +764,13 @@ export async function resumePendingKernelInstalls({ projectRoot, routing = {}, w
     if (vm.node_id && !(ops.nodeReady || ((id) => clusterManager().get(id)?.link?.state === 'ready'))(vm.node_id)) {
       continue
     }
-    if (pending.recovery_attempts >= 3 || (vm.schedule_off === true && !pending.schedule_off)) {
+    // A crash during a local switch may have published the candidate already. Keep the
+    // original backup and the maintenance hold for inspection instead of replaying blindly.
+    if (
+      pending.rollback_package ||
+      pending.recovery_attempts >= 3 ||
+      (vm.schedule_off === true && !pending.schedule_off)
+    ) {
       patchVmRecord(projectRoot, vm.id, (record) => {
         if (record.kernel_operation?.id !== pending.id) return
         record.kernel_operation.phase = 'failed'
@@ -450,6 +791,7 @@ export async function resumePendingKernelInstalls({ projectRoot, routing = {}, w
       routing,
       watchdog,
       poolScheduler,
+      releaseStoppedBinding,
       ops,
       resumeId: pending.id,
     })

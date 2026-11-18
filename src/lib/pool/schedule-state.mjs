@@ -11,8 +11,6 @@
  * `schedule_manual` are derived on every write so older readers keep working.
  */
 
-import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_TIGHT, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
-
 export const SCHEDULE_STATES = Object.freeze(['on', 'off', 'unschedulable', 'restricted'])
 
 /** Deterministic failures. Text is the panel label after 「不可调度 ·」. */
@@ -70,6 +68,7 @@ const RESTRICTED_SLOT = [
   },
   { match: /^node_offline$/, text: '节点离线' },
   { match: /^kernel_faulted$/, text: '内核故障' },
+  { match: /^license_crag_host_over_quota$/, text: '宿主订阅满额' },
   { match: /^worker_unhealthy$/, text: '槽服务异常' },
   { match: /^maintenance$/, text: '维护中' },
   { match: /^rest_period$/, text: '休息时段' },
@@ -82,8 +81,6 @@ const RESTRICTED_NEW_SESSION = [
   { match: /^seats_full$/, text: '席位满', soft: false },
   { match: /^sessions_full$/, text: '对话窗口满', soft: false },
   // Machine memory (host-memory-pressure.mjs): tight still takes new conversations when no machine has room.
-  { match: /^host_memory_tight$/, text: '主机内存紧张', soft: true },
-  { match: /^host_memory_critical$/, text: '主机内存告急', soft: false },
 ]
 
 /**
@@ -92,12 +89,12 @@ const RESTRICTED_NEW_SESSION = [
  * request waits, and local transport errors.
  */
 const STATELESS = [
-  /^(distill_blocked|policy_blocked|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
-  /^(content_filter_refusal|content_policy_refusal|usage_policy_refusal|invalid_request|entitlement_required|http_\d+)$/,
+  /^(distill_blocked|policy_blocked|crag_policy_blocked|crag_opaque_429|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
+  /^(content_filter_refusal|content_policy_refusal|usage_policy_refusal|third_party_client|invalid_request|entitlement_required|http_\d+)$/,
   /_repairable$/,
   /^(concurrency_limit|concurrency_disabled|rpm_limit|slot_busy|quota_band_inflight|refresh_pending)$/,
-  /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
-  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|vm_unschedulable)$/,
+  /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_credits_required|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
+  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|rate_limited_request|vm_unschedulable)$/,
   /^(wrap_connection_error|worker_transport_failure|worker_timeout|worker_process_exit|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
   // Seat placement labels (why this VM was picked), not a slot condition.
   /^sticky$/,
@@ -401,8 +398,5 @@ export function resolveSlotState({
   if (sessionMax > 0 && (Number(sessions?.active) || 0) >= sessionMax) {
     return restricted('sessions_full', null, 'new_session')
   }
-  const hostLevel = hostMemoryLevelForVm(vm)
-  if (hostLevel === HOST_PRESSURE_CRITICAL) return restricted('host_memory_critical', null, 'new_session')
-  if (hostLevel === HOST_PRESSURE_TIGHT) return restricted('host_memory_tight', null, 'new_session', true)
   return { ...base, schedule_state: 'on' }
 }

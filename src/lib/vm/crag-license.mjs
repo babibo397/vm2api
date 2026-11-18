@@ -9,6 +9,7 @@ import { isCodexVm } from './vm-kind.mjs'
 import { getVm, listVms } from './vm-registry.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
+import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 
 const MESSAGES = {
   license_required: 'Activate a CRAG registration code for this VM before using CRAG.',
@@ -16,11 +17,13 @@ const MESSAGES = {
   license_not_yet_valid: 'The CRAG license is not yet valid. Check the UTC clock and activation date.',
   license_invalid: 'The CRAG registration code or device data is invalid.',
   license_binding_mismatch: 'This CRAG registration code belongs to a different VM or device.',
+  license_crag_host_over_quota: 'This VM exceeds the CRAG host subscription seat limit.',
   license_payload_key_mismatch:
     'The signed registration is for a different CRAG package. Request a grant for this package.',
   license_unconfigured: 'CRAG requires a configured encrypted native package and private Linux runtime storage.',
   license_redeem_unavailable: 'This online device voucher cannot be redeemed.',
   license_redeem_conflict: 'This voucher has already been bound to another device or payload.',
+  payload_key_conflict: 'This voucher or slot conflicts with a different CRAG package key.',
   issuer_mismatch: 'CRAG Authority does not recognize the target package issuer.',
   payload_key_unknown: 'CRAG Authority does not have the target package payload key.',
   license_redeem_target_changed: 'The target slot, package or license changed. Restore the original target and retry.',
@@ -34,6 +37,7 @@ const STATES = {
   license_not_yet_valid: 'not_yet_valid',
   license_invalid: 'invalid',
   license_binding_mismatch: 'invalid',
+  license_crag_host_over_quota: 'invalid',
   license_payload_key_mismatch: 'invalid',
   license_unconfigured: 'unconfigured',
 }
@@ -44,7 +48,12 @@ const text = (value) => typeof value === 'string' && value.length > 0 && value.l
 // Cache package authority only. Registration bytes, binding and UTC validity are
 // deliberately verified afresh on every admission, including after cache hits.
 const packageTrustCache = new Map()
-const MAX_TRUST_ROOTS = 8
+// One entry per installed slot package plus the shared download root. The
+// kernel watchdog admits every slot each tick in a fixed order, so a bound below
+// the slot count turns the LRU into a miss on every admission and re-hashes each
+// full package (hundreds of MB, synchronously) every tick. Entries hold only a
+// public key and ids, so keep the bound well above any realistic host.
+const MAX_TRUST_ROOTS = 512
 const redeemingSlots = new Set()
 const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
 
@@ -185,16 +194,62 @@ function writePrivate(dir, name, data, vm, replace) {
   }
 }
 
-function deviceContext(projectRoot, vm, initialize) {
-  if (vm?.node_id || vm?.runtime?.type === 'kvm') fail('license_unconfigured')
-  // This file is the source bind-mounted at /etc/machine-id, not a vm.json claim.
-  let machine
+function kvmGuestId(vm) {
+  return String(vm.fingerprint?.guest_machine_id || vm.fingerprint?.machine_id || '')
+    .trim()
+    .replaceAll('-', '')
+    .toLowerCase()
+}
+
+function kvmSubscriptionMachineId(vm) {
+  const machine = vm?.fingerprint?.guest_machine_id
+  if (typeof machine !== 'string' || !/^[a-f0-9]{32}$/.test(machine) || /^0{32}$/.test(machine))
+    fail('license_unconfigured')
+  return machine
+}
+
+export function readKvmSubscriptionMachineId(projectRoot, vm, { allowMissingFile = false } = {}) {
+  const guestMachine = kvmSubscriptionMachineId(vm)
+  let fd, machineText
   try {
-    machine = fs.readFileSync(path.join(projectRoot, 'vms', vm.id, 'machine-id'), 'utf8').trim()
-  } catch {
+    fd = fs.openSync(
+      path.join(projectRoot, 'vms', vm.id, 'machine-id'),
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+    )
+  } catch (error) {
+    if (allowMissingFile && error.code === 'ENOENT') return guestMachine
     fail('license_unconfigured')
   }
-  if (!/^[a-fA-F0-9]{32}$/.test(machine)) fail('license_unconfigured')
+  try {
+    const st = fs.fstatSync(fd)
+    if (!st.isFile() || st.size < 32 || st.size > 33) fail('license_unconfigured')
+    const bytes = Buffer.alloc(34)
+    machineText = bytes.subarray(0, fs.readSync(fd, bytes)).toString('utf8')
+  } finally {
+    fs.closeSync(fd)
+  }
+  const machine = machineText.trim()
+  if (!/^[a-f0-9]{32}$/.test(machine) || (machineText !== machine && machineText !== `${machine}\n`))
+    fail('license_unconfigured')
+  if (machine !== guestMachine) fail('license_binding_mismatch')
+  return machine
+}
+
+function deviceContext(projectRoot, vm, initialize, subscription = false) {
+  const kvm = isKvmRuntime(vm)
+  if (!subscription && (vm?.node_id || kvm)) fail('license_unconfigured')
+  // Docker binds this source at /etc/machine-id; KVM must boot with the same identity.
+  let machine
+  if (kvm && !vm.node_id) machine = readKvmSubscriptionMachineId(projectRoot, vm)
+  else {
+    try {
+      machine = fs.readFileSync(path.join(projectRoot, 'vms', vm.id, 'machine-id'), 'utf8').trim()
+    } catch {
+      fail('license_unconfigured')
+    }
+    if (!/^[a-fA-F0-9]{32}$/.test(machine)) fail('license_unconfigured')
+    if (kvm && kvmGuestId(vm) !== machine) fail('license_binding_mismatch')
+  }
   const binding = { version: 1, product: 'crag-v2', vm_id: vm.id, machine_id_hash: sha(Buffer.from(machine)) }
   const dir = cragLicenseDirectory(projectRoot, vm)
   checkDirectory(dir, initialize, vm)
@@ -339,10 +394,10 @@ function packageFingerprint(root) {
   return JSON.stringify(rows)
 }
 
-function trust(projectRoot, installedRoot) {
+function trust(projectRoot, installedRoot, arch) {
   let canonicalRoot
   try {
-    const root = installedRoot ?? cragV2PackageRoot(projectRoot)
+    const root = installedRoot ?? cragV2PackageRoot(projectRoot, arch)
     if (!root || fs.lstatSync(root).isSymbolicLink()) fail('license_unconfigured')
     canonicalRoot = fs.realpathSync(root)
     // Complete membership includes manifest, public key, ciphertext, bootstrap,
@@ -358,7 +413,7 @@ function trust(projectRoot, installedRoot) {
       return cached.authority
     }
     packageTrustCache.delete(canonicalRoot)
-    const verified = verifyCragV2Tree(canonicalRoot, { allowPreviousClaude: useInstalled })
+    const verified = verifyCragV2Tree(canonicalRoot, { arch, allowPreviousClaude: useInstalled })
     if (!verified.ok) fail('license_unconfigured')
     const pem = fs.readFileSync(path.join(canonicalRoot, 'crag-license-public.pem'))
     if (useInstalled && !matchesCragIssuer(projectRoot, verified.manifest.authorization.public_key_id, pem))
@@ -379,12 +434,16 @@ function trust(projectRoot, installedRoot) {
   }
 }
 
-function slotAuthority(projectRoot, vm) {
-  return trust(projectRoot, installedCragV2Root(projectRoot, vm))
+function slotAuthority(projectRoot, vm, preferInstalled = true) {
+  return trust(
+    projectRoot,
+    preferInstalled ? installedCragV2Root(projectRoot, vm) : undefined,
+    vm?.node_id ? 'amd64' : undefined,
+  )
 }
 
-export function cragTargetIds(projectRoot, vm) {
-  const { keyId, issuerId } = slotAuthority(projectRoot, vm)
+export function cragTargetIds(projectRoot, vm, { preferInstalled = true } = {}) {
+  const { keyId, issuerId } = slotAuthority(projectRoot, vm, preferInstalled)
   return { payloadKeyId: keyId, issuerId }
 }
 function publicFailure(vm, error) {
@@ -399,7 +458,6 @@ const UNIVERSAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
 const MAX_HOST_ROSTER_ENTRIES = 10000
 export const MAX_CRAG_HOST_ENTITLEMENT_BYTES = 1536 * 1024
-const verifiedHostEntitlements = new WeakMap()
 
 function exactKeys(value, keys) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail()
@@ -555,7 +613,6 @@ export function verifyCragHostEntitlement(projectRoot, code, hostId, { allowExpi
     const claims = hostEntitlement(code, hostId, publicKey)
     const codeForTime = hostTimeError(claims)
     if (codeForTime && !(allowExpired && codeForTime === 'license_expired')) fail(codeForTime)
-    if (claims.version === 2) verifiedHostEntitlements.set(Object.freeze(claims), publicKey)
     return claims
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
@@ -564,15 +621,14 @@ export function verifyCragHostEntitlement(projectRoot, code, hostId, { allowExpi
 }
 
 function subscriptionSlot(vm) {
+  const kvm = isKvmRuntime(vm)
   const runtime = String(vm?.runtime?.type || vm?.runtime_type || 'docker')
     .trim()
     .toLowerCase()
   if (
     process.platform !== 'linux' ||
-    vm?.node_id ||
     isCodexVm(vm) ||
-    isKvmRuntime(vm) ||
-    runtime !== 'docker' ||
+    (runtime !== 'docker' && !kvm) ||
     ['darwin', 'macos'].includes(vm?.node_platform)
   )
     fail('license_unconfigured')
@@ -604,7 +660,7 @@ function subscriptionStamp(stat) {
   return [stat.dev, stat.ino, stat.size, stat.mode, stat.uid, stat.nlink, stat.mtimeNs, stat.ctimeNs].join(':')
 }
 
-function subscriptionStorage(dir, vm, action, allowPending = false) {
+function subscriptionStorage(dir, vm, action) {
   const fd = subscriptionDirectory(dir)
   const pinned = `/proc/self/fd/${fd}`
   try {
@@ -642,7 +698,10 @@ function subscriptionStorage(dir, vm, action, allowPending = false) {
       }
     }
     function ready() {
-      if (!vm && !allowPending && fs.lstatSync(`${pinned}/sync-pending`, { throwIfNoEntry: false })) fail()
+      if (vm) return
+      const pending = fs.lstatSync(`${pinned}/sync-pending`, { throwIfNoEntry: false })
+      if (!pending) return
+      if (pending.isSymbolicLink() || !pending.isFile() || (pending.mode & 0o022) !== 0) fail()
     }
     function current() {
       ready()
@@ -680,7 +739,17 @@ export function prepareCragSubscriptionBinding(projectRoot, vm) {
   try {
     subscriptionSlot(vm)
     slotAuthority(projectRoot, vm)
-    const ctx = deviceContext(projectRoot, vm, true)
+    if (isKvmRuntime(vm) && !vm.node_id) {
+      kvmSubscriptionMachineId(vm)
+      const machineFile = path.join(projectRoot, 'vms', vm.id, 'machine-id')
+      const stat = fs.lstatSync(machineFile, { throwIfNoEntry: false })
+      if (stat && !stat.isFile()) fail('license_unconfigured')
+    }
+    ensureGuestMachineIdFile(
+      projectRoot,
+      isKvmRuntime(vm) && vm.node_id ? { ...vm, fingerprint: { guest_machine_id: kvmGuestId(vm) } } : vm,
+    )
+    const ctx = deviceContext(projectRoot, vm, true, true)
     return subscriptionStorage(ctx.dir, vm, (storage) => {
       subscriptionDevice(storage, ctx)
       storage.current()
@@ -696,10 +765,17 @@ function subscriptionBinding(
   projectRoot,
   vm,
   slotPermit,
-  { activate = false, seat, verifiedRights, authority = slotAuthority(projectRoot, vm) } = {},
+  {
+    activate = false,
+    seat,
+    verifiedRights,
+    candidateEntitlement,
+    authority = slotAuthority(projectRoot, vm),
+    exportFiles = false,
+  } = {},
 ) {
   subscriptionSlot(vm)
-  const ctx = deviceContext(projectRoot, vm, false)
+  const ctx = deviceContext(projectRoot, vm, false, true)
   return subscriptionStorage(ctx.dir, vm, (privateStorage) => {
     subscriptionDevice(privateStorage, ctx)
     try {
@@ -710,103 +786,117 @@ function subscriptionBinding(
     } catch (error) {
       if (!activate || error?.code !== 'ENOENT') throw error
     }
-    return subscriptionStorage(
-      cragSubscriptionPublicDirectory(projectRoot),
-      null,
-      (hostStorage) => {
-        const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
-        const hostId = decoder.decode(hostStorage.read('host_id', 65)).trim()
-        const entitlement = hostEntitlement(
-          decoder.decode(hostStorage.read('entitlement.code', MAX_CRAG_HOST_ENTITLEMENT_BYTES + 1)).trim(),
-          hostId,
-          authority.publicKey,
-        )
-        const permit = authenticateSubscription(slotPermit, 'CRAGS1', authority.publicKey)
-        exactKeys(permit, [
-          'version',
-          'product',
-          'host_id',
-          'seat',
-          'vm_id',
-          'machine_id_hash',
-          'device_public_key',
-          'payload_key_id',
-          'wrapped_key',
-        ])
-        exactKeys(permit.wrapped_key, ['ephemeral_public_key', 'nonce', 'ciphertext', 'tag'])
-        if (
-          [
-            permit.host_id,
-            permit.vm_id,
-            permit.machine_id_hash,
-            permit.device_public_key,
-            permit.payload_key_id,
-            ...Object.values(permit.wrapped_key),
-          ].some((value) => typeof value !== 'string')
-        )
-          fail()
-        if (permit.version !== 1 || permit.product !== 'crag-v2') fail()
-        subscriptionInteger(permit.seat, 1, 4294967295)
-        if (seat !== undefined && seat !== permit.seat) fail('license_binding_mismatch')
-        if (
-          permit.host_id !== entitlement.host_id ||
-          permit.vm_id !== ctx.device.vm_id ||
-          permit.machine_id_hash !== ctx.device.machine_id_hash ||
-          permit.device_public_key !== ctx.device.public_key ||
-          (entitlement.slot_limit !== 'unlimited' && permit.seat > entitlement.slot_limit)
-        )
-          fail('license_binding_mismatch')
-        if (
-          entitlement.version === 2 &&
-          !entitlement.roster.some((entry) => entry.seat === permit.seat && entry.permit_sha256 === sha(slotPermit))
-        )
-          fail('license_binding_mismatch')
-        if (
-          verifiedRights &&
-          (verifiedRights.revision !== entitlement.revision || verifiedRights.host_id !== entitlement.host_id)
-        )
-          fail('license_binding_mismatch')
-        if (!hex(permit.payload_key_id) || permit.payload_key_id !== authority.keyId) fail()
-        unwrapDeviceKey(permit.wrapped_key, ctx.device, ctx.privateKey, authority.keyId)
-        if (deviceContext(projectRoot, vm, false).machine_code !== ctx.machine_code) fail('license_binding_mismatch')
-        privateStorage.current()
-        hostStorage.current()
-        const timeError = hostTimeError(entitlement)
-        if (activate) {
-          if (timeError) fail(timeError)
+    return subscriptionStorage(cragSubscriptionPublicDirectory(projectRoot), null, (hostStorage) => {
+      const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+      const hostId = decoder.decode(hostStorage.read('host_id', 65)).trim()
+      const entitlementCode =
+        candidateEntitlement ??
+        decoder.decode(hostStorage.read('entitlement.code', MAX_CRAG_HOST_ENTITLEMENT_BYTES + 1)).trim()
+      const entitlement = hostEntitlement(entitlementCode, hostId, authority.publicKey)
+      const permit = authenticateSubscription(slotPermit, 'CRAGS1', authority.publicKey)
+      exactKeys(permit, [
+        'version',
+        'product',
+        'host_id',
+        'seat',
+        'vm_id',
+        'machine_id_hash',
+        'device_public_key',
+        'payload_key_id',
+        'wrapped_key',
+      ])
+      exactKeys(permit.wrapped_key, ['ephemeral_public_key', 'nonce', 'ciphertext', 'tag'])
+      if (
+        [
+          permit.host_id,
+          permit.vm_id,
+          permit.machine_id_hash,
+          permit.device_public_key,
+          permit.payload_key_id,
+          ...Object.values(permit.wrapped_key),
+        ].some((value) => typeof value !== 'string')
+      )
+        fail()
+      if (permit.version !== 1 || permit.product !== 'crag-v2') fail()
+      subscriptionInteger(permit.seat, 1, 4294967295)
+      if (seat !== undefined && seat !== permit.seat) fail('license_binding_mismatch')
+      if (
+        permit.host_id !== entitlement.host_id ||
+        permit.vm_id !== ctx.device.vm_id ||
+        permit.machine_id_hash !== ctx.device.machine_id_hash ||
+        permit.device_public_key !== ctx.device.public_key
+      )
+        fail('license_binding_mismatch')
+      if (entitlement.slot_limit !== 'unlimited' && permit.seat > entitlement.slot_limit)
+        fail('license_crag_host_over_quota')
+      if (
+        entitlement.version === 2 &&
+        !entitlement.roster.some((entry) => entry.seat === permit.seat && entry.permit_sha256 === sha(slotPermit))
+      )
+        fail('license_binding_mismatch')
+      if (
+        verifiedRights &&
+        (verifiedRights.revision !== entitlement.revision || verifiedRights.host_id !== entitlement.host_id)
+      )
+        fail('license_binding_mismatch')
+      if (!hex(permit.payload_key_id)) fail()
+      if (permit.payload_key_id !== authority.keyId) fail('license_payload_key_mismatch')
+      unwrapDeviceKey(permit.wrapped_key, ctx.device, ctx.privateKey, authority.keyId)
+      if (deviceContext(projectRoot, vm, false, true).machine_code !== ctx.machine_code)
+        fail('license_binding_mismatch')
+      privateStorage.current()
+      hostStorage.current()
+      const timeError = hostTimeError(entitlement)
+      if (exportFiles) {
+        if (timeError) fail(timeError)
+        return { device: JSON.stringify(ctx.device), permit: slotPermit, hostId, entitlement: entitlementCode }
+      }
+      if (activate) {
+        if (timeError) fail(timeError)
+        if (candidateEntitlement === undefined) {
           writePrivate(privateStorage.dir, 'registration.code', `${slotPermit}\n`, vm, true)
           privateStorage.sync()
         }
-        const publicInteger = (value) => (typeof value === 'bigint' ? value.toString() : value)
-        return {
-          license: {
-            ...(timeError
-              ? publicFailure(vm, new CragLicenseError(timeError))
-              : { status: 'valid', valid: true, vm_id: vm.id }),
-            kind: 'online',
-            scope: 'host',
-            binding: 'host',
-            license_id: `${hostId}:${permit.seat}`,
-            host_id: hostId,
-            seat: permit.seat,
-            revision: publicInteger(entitlement.revision),
-            slot_limit: entitlement.slot_limit,
-            issued_at: publicInteger(entitlement.issued_at),
-            not_before: publicInteger(entitlement.issued_at),
-            expires_at: publicInteger(entitlement.expires_at),
-          },
-          machine_code: ctx.machine_code,
-        }
-      },
-      activate && verifiedHostEntitlements.has(verifiedRights),
-    )
+      }
+      const publicInteger = (value) => (typeof value === 'bigint' ? value.toString() : value)
+      return {
+        license: {
+          ...(timeError
+            ? publicFailure(vm, new CragLicenseError(timeError))
+            : { status: 'valid', valid: true, vm_id: vm.id }),
+          kind: 'online',
+          scope: 'host',
+          binding: 'host',
+          license_id: `${hostId}:${permit.seat}`,
+          host_id: hostId,
+          seat: permit.seat,
+          revision: publicInteger(entitlement.revision),
+          slot_limit: entitlement.slot_limit,
+          issued_at: publicInteger(entitlement.issued_at),
+          not_before: publicInteger(entitlement.issued_at),
+          expires_at: publicInteger(entitlement.expires_at),
+        },
+        machine_code: ctx.machine_code,
+      }
+    })
   })
 }
 
-export function activateCragSubscriptionBinding(projectRoot, vm, slotPermit, { seat, verifiedRights } = {}) {
+export function activateCragSubscriptionBinding(
+  projectRoot,
+  vm,
+  slotPermit,
+  { seat, verifiedRights, preferInstalled = true, candidateEntitlement } = {},
+) {
   try {
     if (typeof slotPermit !== 'string') fail()
-    return subscriptionBinding(projectRoot, vm, slotPermit.trim(), { activate: true, seat, verifiedRights })
+    return subscriptionBinding(projectRoot, vm, slotPermit.trim(), {
+      activate: true,
+      seat,
+      verifiedRights,
+      candidateEntitlement,
+      authority: slotAuthority(projectRoot, vm, preferInstalled),
+    })
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
     fail(error?.code === 'ENOENT' ? 'license_required' : 'license_invalid')
@@ -814,13 +904,51 @@ export function activateCragSubscriptionBinding(projectRoot, vm, slotPermit, { s
 }
 
 export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
-  if (process.platform !== 'linux' || vm.node_id || isCodexVm(vm) || isKvmRuntime(vm)) return null
+  if (process.platform !== 'linux' || isCodexVm(vm)) return null
   const registration = storedRegistration(cragLicenseDirectory(projectRoot, vm))
   if (!selectsSubscription(registration)) return null
+  subscriptionSlot(vm)
   const permit = authenticateSubscription(registration, 'CRAGS1', slotAuthority(projectRoot, vm).publicKey)
   if (permit.version !== 1 || permit.product !== 'crag-v2' || permit.host_id !== hostId || permit.vm_id !== vm.id)
     fail('license_binding_mismatch')
   return sha(registration)
+}
+
+// Only call after the new Authority roster has revoked this exact permit.
+export function removeReclaimedCragPermit(projectRoot, vm, digest) {
+  try {
+    return subscriptionStorage(cragLicenseDirectory(projectRoot, vm), vm, (storage) => {
+      const registration = new TextDecoder('utf-8', { fatal: true })
+        .decode(storage.read('registration.code', 65536))
+        .trim()
+      if (!selectsSubscription(registration) || sha(registration) !== digest) return false
+      storage.current()
+      fs.unlinkSync(`${storage.dir}/registration.code`)
+      storage.sync()
+      return true
+    })
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
+export function readCragSubscriptionFiles(projectRoot, vm) {
+  const permit = storedRegistration(cragLicenseDirectory(projectRoot, vm))
+  return selectsSubscription(permit) ? subscriptionBinding(projectRoot, vm, permit, { exportFiles: true }) : null
+}
+
+export function readKvmCragLicense(projectRoot, vm) {
+  const permit = storedRegistration(cragLicenseDirectory(projectRoot, vm))
+  if (selectsSubscription(permit)) return subscriptionBinding(projectRoot, vm, permit, { exportFiles: true })
+  const authority = () => slotAuthority(projectRoot, vm)
+  if (permit.startsWith('CRAGU1.') && verifyCragUniversal(permit, authority()).valid) return { permit }
+  const shared = readUniversalCode(projectRoot)
+  return shared && verifyCragUniversal(shared, authority()).valid ? { permit: shared } : null
+}
+
+export function readCragClusterSubscription(projectRoot, vm) {
+  return vm.node_id && !isKvmRuntime(vm) ? readCragSubscriptionFiles(projectRoot, vm) : null
 }
 
 export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(Date.now() / 1000) }) {
@@ -853,10 +981,10 @@ export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(D
       claims.not_before !== claims.issued_at ||
       claims.expires_at <= claims.issued_at ||
       claims.expires_at !== calendarExpiry(claims.issued_at, claims.term) ||
-      !hex(claims.payload_key_id) ||
-      claims.payload_key_id !== keyId
+      !hex(claims.payload_key_id)
     )
       fail()
+    if (claims.payload_key_id !== keyId) fail('license_payload_key_mismatch')
     const aad = Buffer.concat([
       UNIVERSAL_WRAP,
       Buffer.from(claims.license_id),
@@ -1054,7 +1182,7 @@ export async function distributeCragUniversalGrant(projectRoot) {
 
 export function getCragLicense(projectRoot, vm, { initialize = false, preferInstalled = true } = {}) {
   let ctx
-  const authority = () => slotAuthority(projectRoot, preferInstalled ? vm : undefined)
+  const authority = () => slotAuthority(projectRoot, vm, preferInstalled)
   try {
     const dir = cragLicenseDirectory(projectRoot, vm)
     const stored = storedRegistration(dir)
@@ -1068,9 +1196,20 @@ export function getCragLicense(projectRoot, vm, { initialize = false, preferInst
       const grant = sharedUniversalLicense(projectRoot, authority)
       if (grant) return withMachineCode(projectRoot, vm, grant, initialize)
     }
+    if (!stored) {
+      const target = authority()
+      const absent = { license: publicFailure(vm, { code: 'ENOENT' }), machine_code: '' }
+      if (vm.node_id) return absent
+      if (isKvmRuntime(vm)) {
+        return initialize
+          ? { ...absent, ...machineExport(prepareCragSubscriptionBinding(projectRoot, vm), target.keyId) }
+          : absent
+      }
+      if (!initialize && !fs.existsSync(path.join(projectRoot, 'vms', vm.id, 'machine-id'))) return absent
+      ctx = deviceContext(projectRoot, vm, initialize)
+      return { ...absent, ...machineExport(ctx.machine_code, target.keyId) }
+    }
     ctx = deviceContext(projectRoot, vm, initialize)
-    if (!stored)
-      return { license: publicFailure(vm, { code: 'ENOENT' }), ...machineExport(ctx.machine_code, authority().keyId) }
     const target = authority()
     return {
       license: verifyCragRegistration(stored, { ...ctx, ...target }),
@@ -1087,6 +1226,10 @@ export function activateCragLicense(projectRoot, vm, code) {
     if (trimmed.startsWith('CRAGU1.')) {
       const license = verifyCragUniversal(trimmed, trust(projectRoot))
       if (!license.valid) fail(license.code)
+      // Activation must agree with the next status read before publishing the
+      // installation-wide grant or replacing any slot registration.
+      const targetLicense = verifyCragUniversal(trimmed, slotAuthority(projectRoot, vm))
+      if (!targetLicense.valid) fail(targetLicense.code)
       const dir = cragUniversalDirectory(projectRoot)
       checkDirectory(dir, true, { id: 'crag-universal' })
       writePrivate(dir, 'registration.code', `${trimmed}\n`, { id: 'crag-universal' }, true)
@@ -1135,8 +1278,10 @@ async function requestVoucher(action, body, fetchImpl) {
         return { registration: reply.data.registration_code, replayed: reply.data.replayed }
     }
     if (response.status === 404 && reply.error?.code === 'redeem_unavailable') fail('license_redeem_unavailable')
-    if (response.status === 409 && ['redeem_conflict', 'payload_key_conflict'].includes(reply.error?.code))
+    if (response.status === 409 && reply.error?.code === 'redeem_conflict')
       throw new CragLicenseError('license_redeem_conflict', 409)
+    if (response.status === 409 && reply.error?.code === 'payload_key_conflict')
+      throw new CragLicenseError('payload_key_conflict', 409)
     if (response.status === 409 && reply.error?.code === 'issuer_mismatch')
       throw new CragLicenseError('issuer_mismatch', 409)
     if (response.status === 400 && reply.error?.code === 'payload_key_unknown')
@@ -1165,7 +1310,7 @@ export async function redeemCragDeviceVoucher(
   projectRoot,
   vm,
   voucher,
-  { fetchImpl = globalThis.fetch, getTarget, routing } = {},
+  { fetchImpl = globalThis.fetch, getTarget } = {},
 ) {
   if (typeof voucher !== 'string' || !/^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(voucher)) fail()
   if (process.platform !== 'linux' || vm.node_id || isKvmRuntime(vm) || isCodexVm(vm)) fail('license_unconfigured')
@@ -1173,7 +1318,6 @@ export async function redeemCragDeviceVoucher(
   const slot = path.resolve(projectRoot, 'vms', vm.id)
   const targetAuthority = (target) => {
     const installed = installedCragV2Root(projectRoot, target)
-    if (!installed && resolveKernelDataplane(target, routing) === 'crag') fail('license_unconfigured')
     return trust(projectRoot, installed)
   }
   if (redeemingSlots.has(slot)) throw new CragLicenseError('license_redeem_service', 409)

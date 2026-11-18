@@ -1,37 +1,58 @@
-import { useEffect, useId, useState } from 'react'
-import { api, isApiError } from '@/lib/api'
+import { useEffect, useId, useState, type ReactNode } from 'react'
+import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  monthlyFor,
+  yuan,
+  type CommerceRules,
+  type CragPlan as Plan,
+} from './crag-catalog'
+import {
+  commerceColumnClass,
+  densityClass,
+  featuredFallback,
+  type ResolvedLayout,
+} from './crag-layout'
+import { CommercePlanContent, CommerceRulesSummary } from './crag-plan-content'
 
-export type CommerceRules = {
-  unit_amount_minor: number
-  max_amount_minor: number
-  min_months?: number
-  max_months: number
-  min_slots?: number
-  max_slots: number
-  custom_enabled?: boolean
-  custom_renewable?: boolean
-}
-
-type Plan = {
-  sku: string
-  term: string
-  slot_limit: number | 'unlimited'
-  amount_minor: number
-  remaining?: number | null
-  renewable?: boolean
-  enabled?: boolean
-  name?: string
-  description?: string
-  months?: number
-}
+export type { CommerceRules } from './crag-catalog'
 
 export type CommerceSelection = {
   sku: string
   slots?: number
   months?: number
   coupon?: string
+}
+
+export const paymentLabels = { wxpay: '微信支付', alipay: '支付宝' }
+export type PaymentMethod = keyof typeof paymentLabels
+
+export function CragPaymentButtons({
+  channels,
+  disabled,
+  onPay,
+}: {
+  channels: readonly PaymentMethod[]
+  disabled: boolean
+  onPay: (channel: PaymentMethod) => void
+}) {
+  return (
+    <div role='group' aria-label='付款方式' className='flex flex-wrap gap-2'>
+      {channels.map((channel, index) => (
+        <Button
+          key={channel}
+          type='button'
+          className='min-h-11 min-w-24'
+          variant={index === 0 ? 'default' : 'outline'}
+          disabled={disabled}
+          onClick={() => onPay(channel)}
+        >
+          {paymentLabels[channel]}
+        </Button>
+      ))}
+    </div>
+  )
 }
 
 type Quote = {
@@ -42,14 +63,6 @@ type Quote = {
   discount_minor: number
   amount_minor: number
 }
-
-const currency = new Intl.NumberFormat('zh-CN', {
-  style: 'currency',
-  currency: 'CNY',
-  minimumFractionDigits: 0,
-  maximumFractionDigits: 2,
-})
-const yuan = (minor: number) => currency.format(minor / 100)
 
 function count(value: string, min: number, max: number) {
   if (!/^\d+$/.test(value)) return null
@@ -62,6 +75,14 @@ function count(value: string, min: number, max: number) {
 export function quoteProblem(error: unknown) {
   if (!isApiError(error)) return '暂时无法确认报价，请重试。'
   const code = error.code ?? ''
+  if (code === 'shop_device_unavailable')
+    return '无法读取本机宿主设备 ID，请让管理员检查宿主 ID 文件和 Docker 只读挂载，再操作原订单。'
+  if (code === 'shop_host_identity_changed')
+    return '当前宿主设备 ID 与原订阅不一致。请恢复原宿主 ID 配置，不要重复下单或付款。'
+  if (code === 'shop_private_storage_unavailable')
+    return '订单私有存储不可用。请让管理员检查数据目录和原收据密钥，再操作原订单。'
+  if (code === 'shop_device_checkout_required')
+    return '请允许浏览器 Cookie，刷新设备购买页后重试。'
   if (code.includes('coupon'))
     return '优惠码不可用、次数已用完，或优惠后金额低于 ¥0.01。'
   if (/stock|sold_out|inventory/.test(code)) return '此档首批名额已售罄。'
@@ -83,7 +104,11 @@ export function CragCommerce({
   initialQuoteKey,
   catalogKey,
   customTitle,
+  device = false,
+  paymentMethods,
+  deliveryOptions,
   onOrder,
+  layout,
 }: {
   rules: CommerceRules
   plans: Plan[]
@@ -95,7 +120,16 @@ export function CragCommerce({
   initialQuoteKey: number
   catalogKey?: string
   customTitle?: string
-  onOrder: (selection: CommerceSelection, price: number) => void
+  device?: boolean
+  paymentMethods: readonly PaymentMethod[]
+  deliveryOptions?: ReactNode
+  onOrder: (
+    selection: CommerceSelection,
+    price: number,
+    method: PaymentMethod
+  ) => void
+  /** 目录声明的排版，已由 normalizeLayout 解析，缺省即缺省排版。 */
+  layout: ResolvedLayout
 }) {
   const id = useId()
   const [slots, setSlots] = useState(String(rules.min_slots ?? 1))
@@ -144,7 +178,8 @@ export function CragCommerce({
     if (!canQuote) return
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
-      void api<Quote>('/api/panel/crag-shop/quote', {
+      const quoteRequest = device ? cragDeviceApi<Quote> : api<Quote>
+      void quoteRequest(device ? '/quote' : '/api/panel/crag-shop/quote', {
         method: 'POST',
         body,
         signal: controller.signal,
@@ -177,25 +212,36 @@ export function CragCommerce({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [body, canQuote, key, rules.max_amount_minor, sku])
+  }, [body, canQuote, device, key, rules.max_amount_minor, sku])
 
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)
 
+  const density = layout.cardDensity
+  const space = densityClass[density]
+  const visiblePlans = plans.filter((plan) => plan.enabled !== false)
+  const featuredSku =
+    layout.featuredSku &&
+    visiblePlans.some((plan) => plan.sku === layout.featuredSku)
+      ? layout.featuredSku
+      : null
+
   return (
     <div className='space-y-4'>
-      <p className='text-sm text-muted-foreground'>
-        标准价 {yuan(rules.unit_amount_minor)} / 槽位 / 月，人民币结算。
-        优惠后单笔不超过 {yuan(rules.max_amount_minor)}，实付以供应方报价为准。
-      </p>
-      <fieldset className='grid gap-2' disabled={busy}>
-        <legend className='mb-2 text-sm font-medium'>固定套餐与续费</legend>
-        {plans
-          .filter((plan) => plan.enabled !== false)
-          .map((plan) => (
+      {plans.length > 0 || allowRenewal ? (
+        <fieldset
+          className={`grid ${space.grid} ${commerceColumnClass[layout.planColumns]}`}
+          disabled={busy}
+        >
+          <legend className='mb-2 text-sm font-medium'>
+            固定套餐{allowRenewal ? '与续费' : ''}
+          </legend>
+          {visiblePlans.map((plan) => (
             <label
               key={plan.sku}
-              className='flex items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary has-enabled:cursor-pointer'
+              data-density={density}
+              data-featured={plan.sku === featuredSku || undefined}
+              className={`flex items-center gap-3 rounded-xl border bg-card ${space.card} text-sm text-card-foreground shadow-xs transition-colors has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20 has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:border-primary/50 has-disabled:opacity-60`}
             >
               <input
                 type='radio'
@@ -205,60 +251,40 @@ export function CragCommerce({
                 disabled={plan.remaining === 0}
                 onChange={() => onSelect(plan.sku)}
               />
-              <span className='min-w-0 flex-1'>
-                <span className='block font-medium'>
-                  {plan.name ? (
-                    <span className='block'>{plan.name}</span>
-                  ) : null}
-                  {plan.slot_limit === 'unlimited'
-                    ? '不限槽位'
-                    : `${plan.slot_limit} 槽位`}{' '}
-                  /{' '}
-                  {plan.months ??
-                    (plan.term === '1y'
-                      ? '12'
-                      : plan.term.replace(/m$/, ''))}{' '}
-                  个月
-                </span>
-                {plan.description ? (
-                  <span className='block whitespace-pre-line text-muted-foreground'>
-                    {plan.description}
-                  </span>
-                ) : null}
-                <span className='block text-xs text-muted-foreground'>
-                  {plan.remaining === 0
-                    ? '首批售罄'
-                    : plan.remaining != null
-                      ? `首批剩余 ${plan.remaining} 份`
-                      : '订阅套餐'}
-                  {plan.renewable === true
-                    ? ' · 可续费'
-                    : plan.renewable === false
-                      ? ' · 不可续费'
-                      : ''}
-                </span>
-              </span>
-              <span className='shrink-0 font-semibold tabular-nums'>
-                {yuan(plan.amount_minor)}
-              </span>
+              <CommercePlanContent
+                plan={plan}
+                density={density}
+                featured={
+                  plan.sku === featuredSku
+                    ? (layout.featuredLabel ?? featuredFallback)
+                    : undefined
+                }
+                monthly={monthlyFor(
+                  layout,
+                  plan.amount_minor,
+                  plan.term,
+                  plan.months
+                )}
+              />
             </label>
           ))}
-        {allowRenewal ? (
-          <label className='flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary'>
-            <input
-              type='radio'
-              name={id}
-              className='accent-primary'
-              checked={sku === 'renewal'}
-              onChange={() => onSelect('renewal')}
-            />{' '}
-            续费本机当前套餐
-          </label>
-        ) : null}
-      </fieldset>
+          {allowRenewal ? (
+            <label className='flex cursor-pointer items-center gap-3 rounded-xl border bg-card p-4 text-sm font-medium shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
+              <input
+                type='radio'
+                name={id}
+                className='accent-primary'
+                checked={sku === 'renewal'}
+                onChange={() => onSelect('renewal')}
+              />{' '}
+              续费本机当前套餐
+            </label>
+          ) : null}
+        </fieldset>
+      ) : null}
       {customEnabled ? (
         <fieldset
-          className='space-y-3 rounded-md border p-3 has-checked:border-primary'
+          className='space-y-2 rounded-xl border bg-card px-4 py-3 has-checked:border-primary'
           disabled={busy}
         >
           <legend className='px-1 text-sm font-medium'>
@@ -274,33 +300,36 @@ export function CragCommerce({
             />
             选择自定义套餐
           </label>
-          <div className='grid gap-3 sm:grid-cols-2'>
-            <label className='grid gap-1.5 text-sm'>
-              槽位数
-              <Input
-                value={slots}
-                inputMode='numeric'
-                maxLength={8}
-                disabled={sku !== 'custom'}
-                onChange={(e) => setSlots(e.target.value)}
-              />
-            </label>
-            <label className='grid gap-1.5 text-sm'>
-              月数
-              <Input
-                value={months}
-                inputMode='numeric'
-                maxLength={3}
-                disabled={sku !== 'custom'}
-                onChange={(e) => setMonths(e.target.value)}
-              />
-            </label>
-          </div>
-          {sku === 'custom' && !available ? (
-            <p className='text-sm text-destructive'>
-              槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
-              月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
-            </p>
+          {sku === 'custom' ? (
+            <>
+              <CommerceRulesSummary rules={rules} />
+              <div className='grid max-w-xl gap-3 sm:grid-cols-2'>
+                <label className='grid gap-1.5 text-sm'>
+                  槽位数
+                  <Input
+                    value={slots}
+                    inputMode='numeric'
+                    maxLength={8}
+                    onChange={(e) => setSlots(e.target.value)}
+                  />
+                </label>
+                <label className='grid gap-1.5 text-sm'>
+                  月数
+                  <Input
+                    value={months}
+                    inputMode='numeric'
+                    maxLength={3}
+                    onChange={(e) => setMonths(e.target.value)}
+                  />
+                </label>
+              </div>
+              {sku === 'custom' && !available ? (
+                <p className='text-sm text-destructive'>
+                  槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
+                  月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
+                </p>
+              ) : null}
+            </>
           ) : null}
         </fieldset>
       ) : null}
@@ -382,10 +411,11 @@ export function CragCommerce({
           </p>
         ) : null}
       </div>
-      <Button
-        type='button'
+      {sku !== 'renewal' ? deliveryOptions : null}
+      <CragPaymentButtons
+        channels={paymentMethods}
         disabled={!canQuote || !current?.quote || busy}
-        onClick={() => {
+        onPay={(method) => {
           if (!canQuote || busy || !current?.quote) return
           const selection: CommerceSelection = {
             sku,
@@ -394,11 +424,9 @@ export function CragCommerce({
               : {}),
             ...(appliedCoupon ? { coupon: appliedCoupon } : {}),
           }
-          onOrder(selection, current.quote.amount_minor)
+          onOrder(selection, current.quote.amount_minor, method)
         }}
-      >
-        {sku === 'renewal' ? '创建续费订单' : '创建订单'}
-      </Button>
+      />
     </div>
   )
 }

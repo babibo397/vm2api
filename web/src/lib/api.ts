@@ -145,6 +145,19 @@ export async function api<T = unknown>(
   return unwrapEnvelope(json, res.status) as T
 }
 
+export async function cragDeviceApi<T>(path: string, opts: RequestInit = {}) {
+  const res = await fetch(`/api/panel/crag-shop/device${path}`, {
+    ...opts,
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const json: unknown = await res.json().catch(() => ({}))
+  if (!res.ok)
+    throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
+  return unwrapEnvelope(json, res.status) as T
+}
+
 export type VmPatch = {
   inference_engine?: 'go' | 'rust' | ''
   persona_preset?: string
@@ -186,6 +199,10 @@ export type VmKernelSwitchJob = VmKernelSwitchTarget & {
   started_at: string
   finished_at: string | null
   error: { code: string; message: string } | null
+  reclaim_pending?: boolean
+  deferred_start?: boolean
+  deferred_reason?: string | null
+  start_error?: string | null
 }
 
 export function startVmKernelSwitch(id: string, body: VmKernelSwitchTarget) {
@@ -205,16 +222,6 @@ export function getVmKernelSwitch(id: string, signal?: AbortSignal) {
 export function getVmCragLicense(id: string) {
   return api<CragLicenseResponse>(
     `/api/panel/vms/${encodeURIComponent(id)}/crag-license`
-  )
-}
-
-export function activateVmCragLicense(id: string, registrationCode: string) {
-  return api<CragLicenseResponse>(
-    `/api/panel/vms/${encodeURIComponent(id)}/crag-license`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ registration_code: registrationCode }),
-    }
   )
 }
 

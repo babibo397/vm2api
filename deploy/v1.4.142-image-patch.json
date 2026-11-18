@@ -1,0 +1,19 @@
+{
+  "spec": {
+    "template": {
+      "metadata": {
+        "annotations": {
+          "vm2api.fireflyops.cn/source-revision": "tree-3299d823f24c530eab08eb36108d671e9182721a"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "vm2api",
+            "image": "hx-repo-xjp.tencentcloudcr.com/devops/vm2api@sha256:a91b072b689b828cda2179bd5f3c2e68a91e2d3515c3d244202f931e9f4a84d4"
+          }
+        ]
+      }
+    }
+  }
+}

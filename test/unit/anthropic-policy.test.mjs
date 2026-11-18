@@ -779,6 +779,35 @@ test('official Claude Code tool names stay, stray mcp_ names do not', () => {
   assert.equal(result.reverse.Bash, undefined)
 })
 
+test('native client scrub shares untouched blocks without modifying tool history', () => {
+  const text = { type: 'text', text: 'retain content' }
+  const schema = { type: 'object' }
+  const body = {
+    tools: [{ name: 'lookup', input_schema: schema }],
+    messages: [
+      { role: 'user', content: [text] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_pair', name: 'lookup', input: {} }] },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_pair',
+            content: [{ type: 'tool_reference', tool_name: 'lookup' }],
+          },
+        ],
+      },
+    ],
+  }
+  const original = structuredClone(body)
+  const optimized = scrubUpstreamClientBody(body, { shareUnchanged: true })
+  assert.deepEqual(optimized, scrubUpstreamClientBody(original))
+  assert.deepEqual(body, original)
+  assert.equal(optimized.body.messages[0].content[0], text)
+  assert.equal(optimized.body.tools[0].input_schema, schema)
+  assert.deepEqual(optimized.reverse, { mcp__lookup: 'lookup' })
+})
+
 test('#953 third-party scrub rewrites tool_reference inside tool_result history', () => {
   const result = scrubUpstreamClientBody({
     tools: [
@@ -812,6 +841,33 @@ test('#953 third-party scrub rewrites tool_reference inside tool_result history'
   assert.equal(result.body.messages[0].content[0].name, 'mcp__ToolSearch')
   assert.equal(result.body.messages[1].content[0].content[0].tool_name, 'mcp__WebSearch')
   assert.equal(result.reverse.mcp__WebSearch, 'WebSearch')
+})
+
+test('third-party tool additions and removals follow the declared tool name', () => {
+  const body = {
+    tools: [{ name: 'lookup_doc', input_schema: { type: 'object' } }],
+    messages: [
+      { role: 'user', content: 'lookup' },
+      {
+        role: 'system',
+        content: ['tool_addition', 'tool_removal'].map((type) => ({
+          type,
+          tool: { type: 'tool_reference', name: 'lookup_doc' },
+        })),
+      },
+    ],
+  }
+  const normalized = toStandardAnthropicBody(body).body
+  assert.equal(normalized.tools[0].name, 'mcp__lookup_doc')
+  assert.deepEqual(
+    normalized.messages[1].content.map((block) => block.tool.name),
+    ['mcp__lookup_doc', 'mcp__lookup_doc'],
+  )
+  assert.deepEqual(
+    body.messages[1].content.map((block) => block.tool.name),
+    ['lookup_doc', 'lookup_doc'],
+  )
+  assert.deepEqual(toStandardAnthropicBody(body, { official: true }).body.messages[1], body.messages[1])
 })
 
 test('#953 client-supplied mcp__ names in tool_reference stay unchanged', () => {

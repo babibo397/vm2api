@@ -3,15 +3,21 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { geminiSlot } from './gemini-slot'
 import { VmTable } from './vm-list-table'
+import { VmRack } from './vm-rack'
 import { VmSchedulingBlock, VmSchedulingEditor } from './vm-scheduling'
+import { filterVms } from './vm-table'
 
 vi.mock('./vm-actions-context', () => ({ useVmActions: () => ({}) }))
 vi.mock('./vm-action-menu', () => ({ VmActionMenu: () => null }))
 vi.mock('./vm-owner-line', () => ({ VmRentedMark: () => null }))
 vi.mock('./vm-perms', () => ({ useVmPerms: () => ({ admin: false }) }))
 vi.mock('./use-vm-column-order', () => ({
-  useVmColumnOrder: () => ({ order: ['vm', 'type'], isDefault: true }),
+  useVmColumnOrder: () => ({
+    order: ['vm', 'sched', 'status'],
+    isDefault: true,
+  }),
 }))
 vi.mock('@/components/ui/dialog', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/components/ui/dialog')>()),
@@ -20,7 +26,9 @@ vi.mock('@/components/ui/dialog', async (importOriginal) => ({
 
 function render(over: Partial<Vm> = {}) {
   return renderToStaticMarkup(
-    <VmTable vms={[{ id: 'vm-01', email: 'account@example.com', ...over }]} />
+    <QueryClientProvider client={new QueryClient()}>
+      <VmTable vms={[{ id: 'vm-01', email: 'account@example.com', ...over }]} />
+    </QueryClientProvider>
   )
 }
 
@@ -36,11 +44,10 @@ describe('VM scheduling priority', () => {
         weight: 42,
       }
       const list = render(vm)
-      expect(list).toContain('>调度优先级</')
-      expect(list).toContain(
-        '>调度优先级 <span class="font-semibold tabular-nums text-blue-800 dark:text-blue-200">8</span>'
+      expect(list).toContain('>调度 · 优先级</div>')
+      expect(list).toMatch(
+        /text-blue-800[^"]*shadow-\[inset_0_0_0_1px_currentColor\][^"]*"[^>]*>P8</
       )
-      expect(list).not.toMatch(/background-color:[^";]+[^>]*>调度优先级/)
       expect(list).not.toMatch(/等级|权重/)
 
       const detail = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
@@ -58,13 +65,82 @@ describe('VM scheduling priority', () => {
   )
 
   it('does not substitute legacy weight when priority is missing', () => {
-    expect(render({ weight: 4 })).toContain(
-      '>调度优先级 <span class="font-semibold tabular-nums text-muted-foreground">—</span>'
+    expect(render({ weight: 4 })).toMatch(/>P—</)
+  })
+})
+
+describe('VM row interaction and health', () => {
+  it('opens detail from a left button and exposes a separate expand control', () => {
+    const html = render()
+    expect(html).toContain('aria-label="打开 vm-01 详情页"')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).toContain('aria-controls="vm-row-detail-vm-01"')
+    expect(html).not.toContain('role="button"')
+  })
+
+  it('shows request success rate and never infers health without requests', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [99, 1] : [0, 0]
     )
+    const html = render({ health_24h: buckets })
+    expect(html).toContain('>99.0%</b>')
+    expect(html).toContain('>99/100</span>')
+    expect(render({ health_24h: null })).toContain('24h 无请求')
+    expect(render({ health_24h: null })).not.toContain('主机内存紧张')
   })
 })
 
 describe('VM account column kernel label', () => {
+  it('shares the VM table and rack with a host Gemini account without VM controls or fake readiness', () => {
+    const gemini = geminiSlot({
+      id: 'gemini-fixture',
+      name: 'Gemini account',
+      proxy_id: 'px-011f7746',
+      auth_state: 'authorized',
+      runtime_ready: false,
+      billing_ready: false,
+      auth_method: 'oauth',
+      kernel_version: '0.3.0-rc.1',
+      created_at: null,
+      updated_at: null,
+      models: [],
+      account: null,
+    })
+    expect(filterVms([gemini], 'px-011f', 'dead', 'gemini')).toEqual([gemini])
+    expect(filterVms([gemini], '', 'all', 'gpt')).toEqual([])
+    expect(filterVms([gemini], '', 'all', 'claude')).toEqual([])
+
+    const openai = { id: 'vm-02', platform: 'openai', has_token: true }
+    const renderSlots = (nodes: ReactNode) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {nodes}
+        </QueryClientProvider>
+      )
+    const table = renderSlots(<VmTable vms={[openai, gemini]} />)
+    expect(table).toContain('aria-label="openai"')
+    expect(table).toContain('data-vm-table')
+    for (const html of [
+      table,
+      renderSlots(<VmRack vms={[gemini]} filter='all' size='l' />),
+    ]) {
+      for (const label of [
+        'Gemini account',
+        'CRAGAnti',
+        '宿主机',
+        '已授权',
+        '载荷未启用推理',
+        'px-011f7746',
+      ]) {
+        expect(html).toContain(label)
+      }
+      expect(html).not.toContain('运行就绪')
+    }
+    const hostOnly = renderSlots(<VmTable vms={[gemini]} />)
+    expect(hostOnly).not.toContain('role="switch"')
+    expect(hostOnly).not.toContain('24h 无请求')
+  })
+
   it.each(['wrap', 'cc'] as const)(
     'renders %s as a silver standard kernel',
     (dataplane) => {
@@ -113,7 +189,7 @@ describe('VM account column kernel label', () => {
     expect(html).toContain('aria-label="anthropic"')
     for (const label of [
       'vm-01',
-      'account@example.com',
+      'account@ex…',
       'Max',
       'kvm',
       'oauth',
@@ -121,6 +197,7 @@ describe('VM account column kernel label', () => {
     ]) {
       expect(html).toMatch(new RegExp(`>${label}</(?:span|div)>`))
     }
+    expect(html).toContain('title="account@example.com"')
     expect(html).not.toContain('订阅 未知')
     expect(html).not.toContain('01·account')
     expect(
@@ -143,5 +220,21 @@ describe('VM account column kernel label', () => {
     expect(render({ platform: 'openai', has_token: true })).toContain(
       '>local</span>'
     )
+  })
+})
+
+describe('VM list summary and toggles', () => {
+  it('renders the fleet summary and both list toggles', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [9, 1] : [0, 0]
+    )
+    const html = render({ health_24h: buckets, seats_used: 1, seats_max: 4 })
+    expect(html).toContain('aria-label="全局汇总"')
+    expect(html).toContain('>在池</div>')
+    expect(html).toContain('>90.0%</b>')
+    expect(html).toContain('失败 1')
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*按状态分组/)
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*次要信息常显/)
+    expect(html).toContain('data-pin="false"')
   })
 })

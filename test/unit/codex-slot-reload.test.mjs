@@ -441,6 +441,60 @@ test('panel deletion keeps Codex cleanup inside its teardown guard without relea
   assert.equal(fs.existsSync(path.join(f.root, 'vms', first.vm.id)), false)
 })
 
+test('force deleting an unreachable node keeps Codex relay and file cleanup under its kernel guard', async (t) => {
+  const f = await fixture(t)
+  const first = await f.slot('vm-delete-dead')
+  first.vm.node_id = 'node-dead'
+  fs.writeFileSync(path.join(f.root, 'vms', `${first.vm.id}.json`), JSON.stringify(first.vm))
+  const blocked = []
+  const response = {}
+  const handle = createPanelHandler({
+    cfg: { paths: { project: f.root } },
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, body) {
+      response.status = status
+      response.body = body
+      return true
+    },
+    cragSubscription: {
+      teardown() {
+        throw new Error('Codex must not release a Claude subscription')
+      },
+    },
+    clusterManager: {
+      async confirmNodeUnreachable(id) {
+        assert.equal(id, 'node-dead')
+        return { state: 'backoff' }
+      },
+      async dropSlotRelays(id) {
+        assert.equal(id, first.vm.id)
+        assert.equal(codexKernelTracked(id), false)
+        blocked.push(ensureCodexKernel(first.exec))
+      },
+    },
+    proxyPool: {
+      unbindVm() {
+        blocked.push(ensureCodexKernel(first.exec))
+      },
+    },
+  })
+  await handle({ method: 'DELETE' }, {}, new URL(`http://localhost/api/panel/vms/${first.vm.id}?force=1`))
+  assert.equal(response.status, 200)
+  assert.deepEqual(await Promise.all(blocked), [
+    { ok: false, reason: 'teardown_in_progress' },
+    { ok: false, reason: 'teardown_in_progress' },
+  ])
+  assert.equal(response.body.data.remote_teardown, 'skipped')
+  assert.equal(response.body.data.node_state, 'backoff')
+  assert.equal(codexKernelTracked(first.vm.id), false)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', `${first.vm.id}.json`)), false)
+  assert.equal(fs.existsSync(path.join(f.root, 'vms', first.vm.id)), false)
+})
+
 for (const failRelease of [false, true]) {
   test(`panel Claude deletion ${failRelease ? 'preserves files after failed' : 'cleans files only after'} subscription release`, async (t) => {
     const f = await fixture(t)

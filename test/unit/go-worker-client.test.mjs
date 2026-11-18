@@ -186,6 +186,26 @@ test('setup-token worker envelope is inference-only', () => {
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
 })
 
+test('native queue delegates ordinary headers to CC but keeps compatibility headers', () => {
+  const body = { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }
+  const workerStatus = {
+    runtime_variant: 'crag-v2',
+    capabilities: ['generation_controls_v3', 'linux_tui_native_queue', 'message_threads_beta'],
+  }
+  const args = { body, exec: { workerStatus }, cliHop: true, cragPrint: true }
+  assert.equal(finalizeWorkerPayload(args).headers, undefined)
+  assert.equal(finalizeWorkerPayload(args).body.betas, undefined)
+  for (const overrides of [
+    { requestContext: { purpose: 'auto_mode_classifier', format: 'xml' } },
+    { repaired: true },
+    { body: { ...body, thread: { type: 'create' } } },
+    { exec: { workerStatus: { ...workerStatus, capabilities: ['generation_controls_v3'] } } },
+    { cragPrint: false },
+  ]) {
+    assert.ok(finalizeWorkerPayload({ ...args, ...overrides }).headers['anthropic-beta'])
+  }
+})
+
 test('worker canonicalizes passthrough bodies before either kernel', () => {
   const body = {
     model: 'claude-sonnet-5',
@@ -301,6 +321,37 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   })
   assert.equal(passed.body.thinking.display, 'updates')
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
+})
+
+test('CRAG aligns sampling after resolving explicit or default thinking', () => {
+  const exec = { workerStatus: { runtime_variant: 'crag-v2', capabilities: ['generation_controls_v3'] } }
+  const sampling = { temperature: 0.5, top_p: 0.9, top_k: 10 }
+  for (const [thinking, expectedType] of [
+    [undefined, 'adaptive'],
+    [{ type: 'adaptive' }, 'adaptive'],
+    [{ type: 'enabled', budget_tokens: 1024 }, 'enabled'],
+    [{ type: 'disabled' }, 'disabled'],
+  ]) {
+    const { body } = finalizeWorkerPayload({
+      body: {
+        model: thinking?.type === 'adaptive' || !thinking ? 'claude-opus-5-5' : 'claude-opus-4-8',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+        ...sampling,
+      },
+      exec,
+      cliHop: true,
+    })
+    assert.equal(body.thinking.type, expectedType)
+    if (expectedType === 'disabled') {
+      for (const [key, value] of Object.entries(sampling)) assert.equal(body[key], value)
+      continue
+    }
+    assert.equal(body.temperature, 1)
+    assert.equal(Object.hasOwn(body, 'top_p'), false)
+    assert.equal(Object.hasOwn(body, 'top_k'), false)
+  }
 })
 
 test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
@@ -1857,16 +1908,34 @@ unixTest('invalid Messages are rejected before either kernel accepts a turn', as
   })
   t.after(() => fx.close())
   for (const runtime_variant of ['cli-node', 'crag-v2']) {
-    const exec = { ...fx.exec, workerStatus: { runtime_variant } }
+    const isCrag = runtime_variant === 'crag-v2'
+    const exec = {
+      ...fx.exec,
+      workerStatus: { runtime_variant, capabilities: isCrag ? ['generation_controls_v3'] : [] },
+    }
     for (const send of [callGoWorker, streamGoWorker]) {
       for (const prebuilt of [false, true]) {
-        for (const messages of [
-          [],
-          [{ role: 'user', content: ' \n\t' }],
-          [{ role: 'user', content: 42 }],
-          [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }],
+        for (const fields of [
+          { messages: [] },
+          { messages: [{ role: 'user', content: ' \n\t' }] },
+          { messages: [{ role: 'user', content: 42 }] },
+          { messages: [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }] },
+          {
+            messages: [
+              { role: 'assistant', content: [{ type: 'tool_use', id: 'call_bad', name: 'sample', input: [] }] },
+            ],
+          },
+          { tools: [{ type: 'function', name: 'sample', parameters: { type: 'object' } }] },
+          { tools: [{ name: 'sample', input_schema: { type: 'string' } }] },
+          {
+            tools: [
+              { name: 'sample', input_schema: { type: 'object', oneOf: [{ required: ['a'] }, { required: ['b'] }] } },
+            ],
+          },
+          { max_tokens: 3.5 },
+          ...(isCrag ? [{ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }] : []),
         ]) {
-          const body = { model: 'claude-sonnet-5', messages }
+          const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }], ...fields }
           const result = await send({ exec, ...(prebuilt ? { envelope: { body } } : { body }) })
           assert.equal(result.status, 400)
           assert.equal(result.body.error.code, 'invalid_kernel_request')
@@ -1945,5 +2014,44 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
       assert.equal(result.status, 409)
       assert.equal(result.transportError, false)
     }
+  }
+})
+
+unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
+  const details = {
+    type: 'refusal',
+    category: 'reasoning_extraction',
+    explanation: 'Synthetic provider refusal explanation.',
+  }
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'message_start', message: { type: 'message', role: 'assistant', content: [] } })
+    writeData(res, { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: details } })
+    writeData(res, { type: 'message_stop' })
+    writeData(res, {
+      type: 'error',
+      error: { type: 'api_error', message: 'native request completed without response content' },
+    })
+    res.end()
+  })
+  try {
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: {
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'synthetic classifier input' }],
+      },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.committed, false)
+    assert.equal(result.stopReason, 'refusal')
+    assert.deepEqual(result.stopDetails, details)
+    assert.equal(result.body.error.code, 'empty_response')
+    assert.deepEqual(lines, [])
+  } finally {
+    await fx.close()
   }
 })

@@ -71,6 +71,8 @@ export const ErrorCode = {
   UPSTREAM_EMPTY_STREAM: 'upstream_empty_stream',
   CLI_ERROR: 'cli_error',
   KERNEL_UNAVAILABLE: 'kernel_unavailable',
+  CLUSTER_SLOT_RECONNECTING: 'cluster_slot_reconnecting',
+  CLUSTER_DELIVERY_UNCONFIRMED: 'cluster_delivery_unconfirmed',
   KERNEL_ERROR: 'kernel_error',
   FABLE_REQUIRES_MAX: 'fable_requires_max',
   NATIVE_HANDOFF_MISSING: 'native_handoff_missing',
@@ -88,6 +90,7 @@ export const ErrorCode = {
   DISTILL_BLOCKED: 'distill_blocked',
   REFUSAL_GUARD: 'refusal_guard',
   CONTENT_FILTER_REFUSAL: 'content_filter_refusal',
+  THIRD_PARTY_CLIENT: 'third_party_client',
   POLICY_BLOCKED: 'policy_blocked',
   // resource
   VM_NOT_FOUND: 'vm_not_found',
@@ -114,6 +117,8 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
   [ErrorCode.CLI_ERROR]: 502,
   [ErrorCode.KERNEL_ERROR]: 502,
   [ErrorCode.KERNEL_UNAVAILABLE]: 503,
+  [ErrorCode.CLUSTER_SLOT_RECONNECTING]: 503,
+  [ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED]: 502,
   [ErrorCode.NATIVE_HANDOFF_MISSING]: 502,
   [ErrorCode.NATIVE_HANDOFF_INVALID]: 502,
   [ErrorCode.NATIVE_HANDOFF_CONFLICT]: 502,
@@ -148,8 +153,9 @@ const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没�
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
-// Billing refusal, not a content violation and not "extra usage required".
-const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
+// Anthropic bills a non-Claude-Code client against extra usage and refuses it
+// when the seat has none. A client/billing rejection, not a content refusal.
+const THIRD_PARTY_CLIENT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -159,10 +165,35 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+/** Usage Policy text the upstream will not answer for this prompt. */
 export function isUnanswerablePromptMessage(message = '') {
+  return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** "Third-party apps now draw from your extra usage": the caller is not Claude Code. */
+export function isThirdPartyClientMessage(message = '') {
   const text = String(message || '')
-  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
+  return THIRD_PARTY_CLIENT_MESSAGE.test(text) && !USAGE_POLICY_MESSAGE.test(text)
+}
+
+export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
+  '上游将此请求识别为第三方客户端调用，不按订阅额度计费，已拒绝。这不是内容拒答；原样重试会得到同样结果。'
+
+/** Non-retryable client error that keeps the upstream sentence. */
+export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.THIRD_PARTY_CLIENT,
+    message: THIRD_PARTY_CLIENT_CLIENT_MESSAGE,
+    status: 400,
+    details: {
+      upstream_message: String(upstreamMessage || '').slice(0, 300),
+      upstream_type: upstreamType,
+      upstream_status: upstreamStatus,
+      retryable: false,
+    },
+    request_id: requestId,
+  })
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -172,6 +203,7 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   exact: REFUSAL_GUARD_MESSAGE,
   similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
   device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  session: `${REFUSAL_GUARD_MESSAGE} 这个会话此前被上游拒答。`,
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 
@@ -506,7 +538,16 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   // Kernel slot busy on the last hop is capacity, same as a full pool queue.
   if (inboundCode === 'slot_busy' || /rust kernel has no free slot/i.test(String(msg || ''))) {
-    return poolClientError('overloaded')
+    const out = poolClientError('overloaded')
+    // Name the local CRAG queue so a 529 here is not read as provider overload (#1213).
+    const queue = /runtime queue (timeout|is full)/i.exec(String(msg || ''))
+    if (queue) {
+      out.body.error.details = {
+        source: 'local_kernel_queue',
+        reason: queue[1].toLowerCase() === 'timeout' ? 'runtime_queue_timeout' : 'runtime_queue_full',
+      }
+    }
+    return out
   }
   if (
     inboundCode === 'wrap_connection_error' ||
@@ -561,6 +602,14 @@ export function mapUpstreamError(status, body, headers = {}) {
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
       },
       request_id,
+    })
+  }
+  if (isThirdPartyClientMessage(msg)) {
+    return makeThirdPartyClientError({
+      requestId: request_id,
+      upstreamMessage: msg,
+      upstreamType: upType,
+      upstreamStatus: status,
     })
   }
   if (isUnanswerablePromptMessage(msg)) {
